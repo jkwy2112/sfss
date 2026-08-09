@@ -1,0 +1,56 @@
+# SFSS controlled-pilot ClamAV 1.5.3 example. Validate every directive with
+# `clamd --config-file=... --foreground` and `clamconf -n` on the target build.
+# TCP is unauthenticated and unencrypted: keep it on loopback or inside a
+# separately isolated scanner workload boundary.
+Foreground yes
+User clamav
+TCPSocket 3310
+TCPAddr 127.0.0.1
+DatabaseDirectory /var/lib/clamav
+TemporaryDirectory /tmp
+
+# Must equal SFSS_CLAMAV_STREAM_MAX_BYTES and be >= SFSS_MAX_UPLOAD_BYTES.
+StreamMaxLength 2G
+MaxFileSize 2G
+MaxScanSize 2G
+
+# Never silently assume content clean when an internal parser/resource limit
+# is reached. Encrypted/broken containers are also non-clean policy outcomes.
+AlertExceedsMax yes
+AlertEncryptedArchive yes
+AlertEncryptedDoc yes
+AlertBrokenExecutables yes
+AlertBrokenMedia yes
+HeuristicAlerts yes
+
+ScanArchive yes
+ScanPE yes
+ScanELF yes
+ScanPDF yes
+ScanOLE2 yes
+ScanXMLDOCS yes
+MaxRecursion 20
+MaxFiles 10000
+MaxScanTime 1800000
+BytecodeTimeout 60000
+PCREMatchLimit 100000
+PCRERecMatchLimit 5000
+
+MaxThreads 4
+MaxQueue 16
+ReadTimeout 3600
+CommandReadTimeout 30
+SendBufTimeout 500
+ExitOnOOM yes
+LeaveTemporaryFiles no
+FollowFileSymlinks no
+FollowDirectorySymlinks no
+CrossFilesystems no
+SelfCheck 600
+
+# Reduce the unauthenticated command surface on versions supporting these
+# settings. Do not delete the lines to accommodate an old/vulnerable build.
+EnableShutdownCommand no
+EnableReloadCommand no
+EnableStatsCommand no
+EnableVersionCommand yes

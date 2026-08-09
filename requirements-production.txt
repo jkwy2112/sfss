@@ -1,0 +1,9 @@
+# Runtime LDAP dependencies for the sealed production candidate.
+# Refresh only after dependency review, SBOM generation, and vulnerability scanning.
+--only-binary=:all:
+--require-hashes
+
+ldap3==2.9.1 \
+    --hash=sha256:5869596fc4948797020d3f03b7939da938778a0f9e2009f7a072ccf92b8e8d70
+pyasn1==0.6.4 \
+    --hash=sha256:deda9277cfd454080ec40b207fb6df82206a3a2688735233cdcd8d3d565f088b

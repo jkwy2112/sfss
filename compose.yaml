@@ -1,0 +1,25 @@
+services:
+  clamav:
+    image: ${SFSS_CLAMAV_IMAGE:-clamav/clamav:1.5.3}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 6g
+    cpus: 4
+    ports:
+      - "127.0.0.1:3310:3310"
+    volumes:
+      - ./deploy/clamav/clamd.container.conf:/etc/clamav/clamd.conf:ro
+      - clamav-db:/var/lib/clamav
+    tmpfs:
+      - /tmp:size=4g,mode=0700
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+volumes:
+  clamav-db:
