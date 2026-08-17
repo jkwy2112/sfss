@@ -38,6 +38,15 @@ flowchart LR
 
 Files never move directly from green to red or red to green. They pass through a distinct database state, isolated storage, content-derived type decision, conjunctive scanner decision, and—for outbound files—enterprise approval. Do not replace these transitions with a shared cross-zone filesystem mount, SFTP account that can browse both sides, or an operator copy step.
 
+## Two-system split
+
+Production instantiates this architecture **twice** as two independent SFSS systems, one per transfer direction:
+
+- **Inbound system** (`SFSS_DEPLOYMENT_MODE=inbound`): green upload → isolation → scanning → inbound released buffer → red read-only download. Blue host `blue-in-sfss.internal`, data `/srv/sfss-inbound`, socket `/run/sfss-inbound/sfss.sock`, gateways `green-in` / `red-in` / `admin-in`.
+- **Outbound system** (`SFSS_DEPLOYMENT_MODE=outbound`): red upload → outbound isolation → scanning → classification → approval relay → green-release buffer → green download. Blue host `blue-out-sfss.internal`, data `/srv/sfss-outbound`, socket `/run/sfss-outbound/sfss.sock`, gateways `red-out` / `green-out` / `admin-out` (the approval callback exists only here).
+
+Each system owns its database, projects, memberships, service tokens, scanner tier sizing, and audit chain. There is no shared state, shared secret file, or shared service identity between them. Each blue core enforces its single purpose in code: routes, roles, token scopes, job kinds, and network-policy directions of the other workflow return 404/400, and startup fails closed if the other workflow's records appear in the database. Compromise of one system's blue host therefore grants no access to the other direction's data or credentials—use independent gateway CAs and separate LDAP service bindings to preserve that property. A browser user who works in both directions uses the two systems' separate DNS names, so host-only session cookies never collide; each login stays bound to its own system and entrance.
+
 ## Minimum network policy
 
 Every row is default-deny except the exact source, destination, protocol, port, and workload identity shown. Addresses are target-environment inputs, not values to copy from the examples.

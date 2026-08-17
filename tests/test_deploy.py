@@ -155,5 +155,104 @@ class DeploymentTemplateTest(unittest.TestCase):
         self.assertIn("proxy_pass http://sfss_core;", config)
         self.assertNotIn("proxy_pass http://127.0.0.1", config)
 
+    def test_split_system_units_are_single_purpose_and_separated(self):
+        for mode in ("inbound", "outbound"):
+            unit = (ROOT / f"deploy/systemd/sfss-{mode}.service").read_text(encoding="utf-8")
+            env = (ROOT / f"deploy/sfss-{mode}.env.example").read_text(encoding="utf-8")
+            self.assertIn(f"sfss --unix-socket /run/sfss-{mode}/sfss.sock", unit)
+            self.assertIn(f"RuntimeDirectory=sfss-{mode}", unit)
+            self.assertIn(f"ReadWritePaths=/srv/sfss-{mode}", unit)
+            self.assertIn(f"EnvironmentFile=/etc/sfss/sfss-{mode}.env", unit)
+            for directive in ("NoNewPrivileges=true", "ProtectSystem=strict", "MemoryDenyWriteExecute=true",
+                              "SystemCallFilter=@system-service", "KillSignal=SIGTERM"):
+                self.assertIn(directive, unit)
+            self.assertIn(f"SFSS_DEPLOYMENT_MODE={mode}", env)
+            self.assertIn(f"SFSS_DATA_DIR=/srv/sfss-{mode}", env)
+            self.assertIn("SFSS_ENVIRONMENT=production", env)
+            self.assertIn("SFSS_MANIFEST_HMAC_KEY_FILE=", env)
+        combined = (ROOT / "deploy/systemd/sfss.service").read_text(encoding="utf-8")
+        self.assertIn("sfss --unix-socket /run/sfss/sfss.sock", combined)
+        self.assertNotIn("SFSS_DEPLOYMENT_MODE", combined)
+
+    def test_split_blue_cores_proxy_their_own_socket_and_hostname(self):
+        for mode, socket, host in (("inbound", "/run/sfss-inbound/sfss.sock", "blue-in-sfss.internal"),
+                                   ("outbound", "/run/sfss-outbound/sfss.sock", "blue-out-sfss.internal")):
+            config = (ROOT / f"deploy/nginx/blue-core-{mode}.conf").read_text(encoding="utf-8")
+            self.assertIn(f"server unix:{socket};", config)
+            self.assertIn(f"server_name {host};", config)
+            self.assertIn("$ssl_client_s_dn $sfss_gateway_role", config)
+            self.assertIn("X-SFSS-Gateway-Role $sfss_gateway_role", config)
+            self.assertIn("ssl_crl /etc/sfss/tls/zone-gateway-ca.crl.pem", config)
+            self.assertNotIn("proxy_pass http://127.0.0.1", config)
+            for other in ("inbound", "outbound"):
+                if other != mode:
+                    self.assertNotIn(f"/run/sfss-{other}/", config)
+
+    def test_split_zone_gateways_expose_only_their_workflow_routes(self):
+        expectations = {
+            "green-inbound.conf": ("/etc/nginx/sfss-in-green-proxy.inc",
+                                   ("/v1/projects/[^/]+/uploads$", "/v1/uploads/[^/]+/complete$",
+                                    "/v1/uploads/[^/]+/parts/[0-9]+$"),
+                                   ("/v1/projects/[^/]+/outbound", "/download")),
+            "red-inbound.conf": ("/etc/nginx/sfss-in-red-proxy.inc",
+                                 ("/v1/projects/[^/]+/objects/[^/]+/download$",),
+                                 ("/v1/projects/[^/]+/outbound", "/uploads")),
+            "red-outbound.conf": ("/etc/nginx/sfss-out-red-proxy.inc",
+                                  ("/v1/projects/[^/]+/uploads$", "/v1/uploads/[^/]+/parts/[0-9]+$",
+                                   "/v1/projects/[^/]+/outbound$"),
+                                  ("/v1/projects/[^/]+/objects", "decision", "/download")),
+            "green-outbound.conf": ("/etc/nginx/sfss-out-green-proxy.inc",
+                                   ("/v1/projects/[^/]+/outbound$", "/v1/projects/[^/]+/outbound/[^/]+/download$"),
+                                   ("/uploads", "/v1/projects/[^/]+/objects")),
+        }
+        for name, (include, required, forbidden) in expectations.items():
+            config = (ROOT / f"deploy/nginx/{name}").read_text(encoding="utf-8")
+            with self.subTest(gateway=name):
+                self.assertIn(include, config)
+                self.assertIn("proxy_ssl_verify on", (ROOT / "deploy/nginx" /
+                                                      include.split("/")[-1]).read_text(encoding="utf-8"))
+                for route in required:
+                    self.assertIn(route, config)
+                for route in forbidden:
+                    self.assertNotIn(route, config)
+                for directive in ("ssl_protocols TLSv1.2 TLSv1.3", "ssl_session_tickets off",
+                                  "Strict-Transport-Security", "server_tokens off"):
+                    self.assertIn(directive, config)
+
+    def test_split_blue_upstream_targets_and_management_callback_split(self):
+        for system, host in (("in", "blue-in-sfss.internal"), ("out", "blue-out-sfss.internal")):
+            for zone in ("green", "red", "admin"):
+                include = (ROOT / f"deploy/nginx/sfss-{system}-{zone}-proxy.inc").read_text(encoding="utf-8")
+                self.assertIn(f"proxy_pass https://{host}:8443;", include)
+                self.assertIn(f"proxy_ssl_name {host};", include)
+                expected_zone = '""' if zone == "admin" else zone
+                self.assertIn(f"proxy_set_header X-SFSS-Zone {expected_zone};", include)
+                self.assertIn("proxy_ssl_verify on", include)
+                self.assertIn("proxy_ssl_crl /etc/sfss/tls/blue-ca.crl.pem", include)
+                self.assertIn("X-Forwarded-For $remote_addr", include)
+        inbound_admin = (ROOT / "deploy/nginx/admin-inbound.conf").read_text(encoding="utf-8")
+        self.assertNotIn("integrations/wecom/callback", inbound_admin)
+        self.assertIn("sfss-in-admin-proxy.inc", inbound_admin)
+        outbound_admin = (ROOT / "deploy/nginx/admin-outbound.conf").read_text(encoding="utf-8")
+        self.assertIn("location = /v1/integrations/wecom/callback", outbound_admin)
+        self.assertIn("client_max_body_size 64k", outbound_admin)
+        self.assertIn("sfss-out-admin-proxy.inc", outbound_admin)
+        for config in (inbound_admin, outbound_admin):
+            self.assertIn("health|ready|metrics", config)
+            self.assertIn("allow 10.20.10.0/24", config)
+
+    def test_split_outbound_env_keeps_approval_relay_and_inbound_drops_it(self):
+        outbound = (ROOT / "deploy/sfss-outbound.env.example").read_text(encoding="utf-8")
+        inbound = (ROOT / "deploy/sfss-inbound.env.example").read_text(encoding="utf-8")
+        for name in ("SFSS_APPROVAL_RELAY_SUBMIT_HMAC_KEY_FILE",
+                     "SFSS_APPROVAL_RELAY_CALLBACK_HMAC_KEY_FILE",
+                     "SFSS_APPROVAL_RELAY_CA_SHA256", "SFSS_ALLOW_LOCAL_APPROVAL=false"):
+            self.assertIn(name, outbound)
+            self.assertNotIn(name, inbound)
+        for name in ("SFSS_LDAP_CA_SHA256", "SFSS_YARA_RULES_SHA256", "SFSS_SCANNERS=clamav,yara",
+                     "SFSS_REQUIRE_TRUSTED_PROXY=true"):
+            for env in (inbound, outbound):
+                self.assertIn(name, env)
+
 
 if __name__ == "__main__": unittest.main()

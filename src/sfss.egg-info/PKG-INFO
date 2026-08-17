@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: sfss
+Version: 0.3.0
+Summary: Secure File Shuttle System foundation
+Requires-Python: >=3.9
+Provides-Extra: ldap
+Requires-Dist: ldap3==2.9.1; extra == "ldap"
+Requires-Dist: pyasn1==0.6.4; extra == "ldap"

@@ -223,7 +223,7 @@ def upload(args):
             saved = load_state(state_path)
             if (saved.get("file") == identity and saved.get("expected_sha256") == expected_sha256 and
                     saved.get("server") == args.server.rstrip("/") and
-                    saved.get("project") == args.project and saved.get("direction") == args.direction):
+                    saved.get("direction") == args.direction):
                 session = api.json("GET", f'/v1/uploads/{quote(saved["upload_id"])}')
         except Exception:
             session = None
@@ -233,11 +233,11 @@ def upload(args):
         print(json.dumps(record, ensure_ascii=False, sort_keys=True))
         return
     if not session or session.get("state") != "uploading":
-        session = api.json("POST", f"/v1/projects/{quote(args.project)}/uploads", {
+        session = api.json("POST", "/v1/uploads", {
             "direction": args.direction, "filename": source.name, "total_size": identity["size"],
             "expected_sha256": expected_sha256,
         })
-        save_state(state_path, {"server":args.server.rstrip("/"), "project":args.project,
+        save_state(state_path, {"server":args.server.rstrip("/"),
                                 "direction":args.direction, "upload_id":session["id"], "file":identity,
                                 "expected_sha256":expected_sha256})
     completed = {part["part_number"] for part in session.get("parts", [])}
@@ -270,10 +270,10 @@ def upload(args):
     print(json.dumps(record, ensure_ascii=False, sort_keys=True))
 
 
-def get_record(api: API, project: str, direction: str, object_id: str):
+def get_record(api: API, direction: str, object_id: str):
     if direction == "inbound":
-        return api.json("GET", f"/v1/projects/{quote(project)}/objects/{quote(object_id)}")
-    rows = api.json("GET", f"/v1/projects/{quote(project)}/outbound")["transfers"]
+        return api.json("GET", f"/v1/objects/{quote(object_id)}")
+    rows = api.json("GET", "/v1/outbound")["transfers"]
     for row in rows:
         if row["id"] == object_id: return row
     raise AgentError("outbound object not found or not visible")
@@ -284,7 +284,7 @@ def verify_manifest(args, record, signature):
     if not key:
         if args.allow_unsigned: return
         raise AgentError("SFSS_AGENT_MANIFEST_KEY is required to verify the transfer manifest")
-    manifest = f'{record["id"]}\n{record["project_id"]}\n{record["size"]}\n{record["sha256"]}'
+    manifest = f'{record["id"]}\n{record["size"]}\n{record["sha256"]}'
     expected = hmac.new(key.encode(), manifest.encode(), hashlib.sha256).hexdigest()
     if not signature or not hmac.compare_digest(signature, expected):
         raise AgentError("download manifest signature verification failed")
@@ -325,7 +325,7 @@ def download(args):
     zone = "red" if args.direction == "inbound" else "green"
     api = API(args.server, args.token, zone, ssl_context(args), args.allow_http, args.proxy,
               getattr(args, "timeout", 3600))
-    record = get_record(api, args.project, args.direction, args.object_id)
+    record = get_record(api, args.direction, args.object_id)
     output = Path(args.output).expanduser().absolute(); partial = output.with_name(output.name + ".part")
     if output.is_symlink() or (output.exists() and not output.is_file()):
         raise AgentError("download output must be a regular non-symlink path")
@@ -336,7 +336,7 @@ def download(args):
     headers = {"If-Range": f'"{record["sha256"]}"'}
     if start: headers["Range"] = f"bytes={start}-"
     kind = "objects" if args.direction == "inbound" else "outbound"
-    path = f"/v1/projects/{quote(args.project)}/{kind}/{quote(args.object_id)}/download"
+    path = f"/v1/{kind}/{quote(args.object_id)}/download"
     if start < record["size"]:
         with api.open("GET", path, headers=headers) as response:
             verify_manifest(args, record, response.headers.get("X-SFSS-Manifest-Signature"))
@@ -365,7 +365,7 @@ def download(args):
         partial.unlink()
     output.chmod(0o400)
     manifest_path = output.with_name(output.name + ".sfss-manifest.json")
-    save_state(manifest_path, {key:record.get(key) for key in ("id","project_id","filename","size","sha256","state")})
+    save_state(manifest_path, {key:record.get(key) for key in ("id","filename","size","sha256","state")})
     print(json.dumps({"output":str(output), "sha256":record["sha256"], "size":size}, ensure_ascii=False))
 
 
@@ -388,10 +388,10 @@ def parser():
                       help="per-request timeout in seconds (30-86400)")
     root.add_argument("--allow-http", action="store_true", help="development only")
     commands = root.add_subparsers(dest="command", required=True)
-    up = commands.add_parser("upload"); up.add_argument("--project", required=True)
+    up = commands.add_parser("upload")
     up.add_argument("--direction", choices=("inbound","outbound"), required=True); up.add_argument("--file", required=True)
     up.add_argument("--parallel", type=int, default=4); up.add_argument("--state-file"); up.set_defaults(action=upload)
-    down = commands.add_parser("download"); down.add_argument("--project", required=True)
+    down = commands.add_parser("download")
     down.add_argument("--direction", choices=("inbound","outbound"), required=True)
     down.add_argument("--object-id", required=True); down.add_argument("--output", required=True)
     down.add_argument("--overwrite", action="store_true")

@@ -66,6 +66,7 @@ def trusted_artifact_sha256(path_value: str, label: str) -> str:
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path
+    deployment_mode: str = "combined"
     auth_backend: str = "local"
     scanners: str = "mock"
     clamav_host: str = "127.0.0.1"
@@ -111,7 +112,7 @@ class Settings:
     ldap_ca_sha256: str = ""
     allow_basic_auth: bool = True
     max_active_uploads_per_user: int = 4
-    max_staged_bytes_per_project: int = 4 * 1024 * 1024 * 1024
+    max_staged_bytes_per_user: int = 4 * 1024 * 1024 * 1024
     min_free_bytes: int = 1024 * 1024 * 1024
     allow_local_approval: bool = True
     approval_relay_url: str = ""
@@ -139,6 +140,7 @@ class Settings:
             "SFSS_APPROVAL_RELAY_CALLBACK_HMAC_KEY", "approval relay callback HMAC")
         return cls(
             data_dir=Path(os.getenv("SFSS_DATA_DIR", "var")),
+            deployment_mode=os.getenv("SFSS_DEPLOYMENT_MODE", "combined").lower().strip(),
             auth_backend=auth_backend,
             scanners=os.getenv("SFSS_SCANNERS", "mock"),
             clamav_host=os.getenv("SFSS_CLAMAV_HOST", "127.0.0.1"),
@@ -184,7 +186,7 @@ class Settings:
             ldap_ca_sha256=os.getenv("SFSS_LDAP_CA_SHA256", "").lower().strip(),
             allow_basic_auth=os.getenv("SFSS_ALLOW_BASIC_AUTH", "true").lower() in {"1", "true", "yes"},
             max_active_uploads_per_user=int(os.getenv("SFSS_MAX_ACTIVE_UPLOADS_PER_USER", "4")),
-            max_staged_bytes_per_project=int(os.getenv("SFSS_MAX_STAGED_BYTES_PER_PROJECT", str(4 * 1024 * 1024 * 1024))),
+            max_staged_bytes_per_user=int(os.getenv("SFSS_MAX_STAGED_BYTES_PER_USER", str(4 * 1024 * 1024 * 1024))),
             min_free_bytes=int(os.getenv("SFSS_MIN_FREE_BYTES", str(1024 * 1024 * 1024))),
             allow_local_approval=os.getenv(
                 "SFSS_ALLOW_LOCAL_APPROVAL", "false" if environment == "production" else "true"
@@ -284,6 +286,8 @@ class Settings:
     def validate(self):
         if self.environment not in {"development", "test", "production"}:
             raise ValueError("SFSS_ENVIRONMENT must be development, test, or production")
+        if self.deployment_mode not in {"inbound", "outbound", "combined"}:
+            raise ValueError("SFSS_DEPLOYMENT_MODE must be inbound, outbound, or combined")
         if self.auth_backend not in {"local", "ldap"}: raise ValueError("SFSS_AUTH_BACKEND must be local or ldap")
         if self.auth_backend == "ldap":
             try:
@@ -333,8 +337,8 @@ class Settings:
         if not 1 <= self.job_max_attempts <= 20: raise ValueError("SFSS_JOB_MAX_ATTEMPTS must be between 1 and 20")
         if not 1 <= self.max_active_uploads_per_user <= 100:
             raise ValueError("SFSS_MAX_ACTIVE_UPLOADS_PER_USER must be between 1 and 100")
-        if self.max_staged_bytes_per_project < self.max_upload_bytes:
-            raise ValueError("SFSS_MAX_STAGED_BYTES_PER_PROJECT must be at least SFSS_MAX_UPLOAD_BYTES")
+        if self.max_staged_bytes_per_user < self.max_upload_bytes:
+            raise ValueError("SFSS_MAX_STAGED_BYTES_PER_USER must be at least SFSS_MAX_UPLOAD_BYTES")
         if self.min_free_bytes < 0: raise ValueError("SFSS_MIN_FREE_BYTES cannot be negative")
         if not 1 <= self.approval_relay_timeout_seconds <= 60:
             raise ValueError("SFSS_APPROVAL_RELAY_TIMEOUT_SECONDS must be between 1 and 60")
@@ -342,6 +346,8 @@ class Settings:
             raise ValueError("SFSS_APPROVAL_CALLBACK_MAX_SKEW_SECONDS must be between 30 and 900")
         if self.environment != "production": return
         errors = []
+        if self.deployment_mode == "combined":
+            errors.append("production requires a single-purpose inbound or outbound deployment mode")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+\-]{0,127}", self.release_id):
             errors.append("production release ID is required and must be a safe identifier")
         if not re.fullmatch(r"\d+\.\d+\.\d+", self.expected_python_version):

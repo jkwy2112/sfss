@@ -59,11 +59,12 @@ class SFSSService:
         self._upload_session_lock = threading.Lock()
         self._upload_locks = {}
         self._accepted_security_artifacts = {}
-        private_directories = (
-            settings.data_dir, settings.data_dir / "objects", self.isolation, self.released,
-            settings.data_dir / "outbound", self.outbound_isolation, self.outbound_released,
-            self.upload_staging,
-        )
+        private_directories = [settings.data_dir, self.upload_staging]
+        if self.workflow_enabled("inbound"):
+            private_directories.extend((settings.data_dir / "objects", self.isolation, self.released))
+        if self.workflow_enabled("outbound"):
+            private_directories.extend((settings.data_dir / "outbound", self.outbound_isolation,
+                                        self.outbound_released))
         for directory in private_directories:
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             directory.chmod(0o700)
@@ -79,6 +80,13 @@ class SFSSService:
                     configured[f"yara:{scanner.rules_path}"] = scanner.rules_path
             for label, path in configured.items():
                 self._accepted_security_artifacts[label] = (str(Path(path)), self._artifact_identity(path))
+
+    def workflow_enabled(self, direction: str) -> bool:
+        return self.settings.deployment_mode in {"combined", direction}
+
+    def require_workflow(self, direction: str):
+        if direction not in {"inbound", "outbound"} or not self.workflow_enabled(direction):
+            raise ServiceError(404, f"{direction} workflow is not deployed on this system")
 
     @staticmethod
     def _artifact_identity(path):
@@ -164,15 +172,18 @@ class SFSSService:
         if required_bytes < 0 or status["free_bytes"] - required_bytes < status["reserve_bytes"]:
             raise ServiceError(507, "insufficient storage capacity while preserving the safety reserve")
 
-    def create_upload_session(self, project_id: str, direction: str, filename: str, total_size: int,
+    def _require_active_user(self, actor: str):
+        row = self.store.one("SELECT enabled FROM users WHERE username=?", (actor,))
+        if not row or not row["enabled"]:
+            raise ServiceError(403, "account is disabled or unknown")
+
+    def create_upload_session(self, direction: str, filename: str, total_size: int,
                               actor: str, expected_sha256: Optional[str] = None, audit=None) -> Dict:
-        if direction == "inbound":
-            self.require_role(project_id, actor, {"admin", "uploader"})
-        elif direction == "outbound":
-            self.require_outbound_role(project_id, actor, {"red_uploader"})
-            if not self.outbound_policy(project_id)["enabled"]:
-                raise ServiceError(403, "outbound transfer is disabled for this project")
-        else:
+        self.require_workflow(direction)
+        self._require_active_user(actor)
+        if direction == "outbound" and not self.outbound_policy()["enabled"]:
+            raise ServiceError(403, "outbound transfer is disabled by platform policy")
+        if direction not in {"inbound", "outbound"}:
             raise ServiceError(400, "invalid upload direction")
         if not self._valid_filename(filename):
             raise ServiceError(400, "invalid filename")
@@ -197,13 +208,13 @@ class SFSSService:
             if active >= active_limit:
                 raise ServiceError(429, "too many active upload sessions for this user")
             staged_limit = int(self.store.get_config(
-                "max_staged_bytes_per_project", str(self.settings.max_staged_bytes_per_project)))
+                "max_staged_bytes_per_user", str(self.settings.max_staged_bytes_per_user)))
             reserved = self.store.one(
                 "SELECT COALESCE(SUM(total_size),0) AS value FROM upload_sessions "
-                "WHERE project_id=? AND state IN ('uploading','completing')", (project_id,),
+                "WHERE actor=? AND state IN ('uploading','completing')", (actor,),
             )["value"]
             if reserved + total_size > staged_limit:
-                raise ServiceError(429, "project upload staging reservation is exhausted")
+                raise ServiceError(429, "user upload staging reservation is exhausted")
             received = self.store.one(
                 "SELECT COALESCE(SUM(p.size),0) AS value FROM upload_parts p JOIN upload_sessions s "
                 "ON s.id=p.upload_id WHERE s.state IN ('uploading','completing')"
@@ -218,13 +229,13 @@ class SFSSService:
             target.mkdir(mode=0o700)
             try:
                 statement = (
-                    "INSERT INTO upload_sessions(id,project_id,actor,direction,filename,total_size,chunk_size,expected_sha256,state,created_at,updated_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (upload_id, project_id, actor, direction, filename, total_size, chunk_size, expected,
+                    "INSERT INTO upload_sessions(id,actor,direction,filename,total_size,chunk_size,expected_sha256,state,created_at,updated_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (upload_id, actor, direction, filename, total_size, chunk_size, expected,
                      "uploading", now, now, now + max(300, session_ttl)),
                 )
                 audited = (dict(audit) if audit is not None else {
                     "request_id":f"upload-session-created-{upload_id}", "actor":actor,
-                    "action":"upload.session.create", "project_id":project_id, "object_id":upload_id,
+                    "action":"upload.session.create", "object_id":upload_id,
                     "outcome":"success", "source_zone":direction, "remote_addr":"local", "details":{}})
                 audited["object_id"] = upload_id
                 details = dict(audited.get("details") or {})
@@ -240,15 +251,8 @@ class SFSSService:
         session = self.store.one("SELECT * FROM upload_sessions WHERE id=?", (upload_id,))
         if not session:
             raise ServiceError(404, "upload session not found")
-        project_admin = "admin" in self.store.roles(session["project_id"], actor)
-        global_admin = self.store.is_global_admin(actor)
-        if session["actor"] != actor and not project_admin and not global_admin:
+        if session["actor"] != actor and not self.store.is_global_admin(actor):
             raise ServiceError(403, "upload session permission denied")
-        if session["actor"] == actor and not project_admin and not global_admin:
-            allowed = (self.store.roles(session["project_id"], actor).intersection({"admin", "uploader"})
-                       if session["direction"] == "inbound"
-                       else self.outbound_roles(session["project_id"], actor).intersection({"red_uploader"}))
-            if not allowed: raise ServiceError(403, "upload session permission denied")
         parts = self.store.all(
             "SELECT part_number,offset,size,sha256,completed_at FROM upload_parts WHERE upload_id=? ORDER BY part_number",
             (upload_id,),
@@ -259,14 +263,12 @@ class SFSSService:
         return session
 
     def require_upload_session_write(self, session: Dict, actor: str):
+        self.require_workflow(session["direction"])
+        self._require_active_user(actor)
         if session["actor"] != actor:
             raise ServiceError(403, "only the upload owner can write this session")
-        if session["direction"] == "inbound":
-            self.require_role(session["project_id"], actor, {"admin", "uploader"})
-            return
-        self.require_outbound_role(session["project_id"], actor, {"red_uploader"})
-        if not self.outbound_policy(session["project_id"])["enabled"]:
-            raise ServiceError(403, "outbound transfer is disabled for this project")
+        if session["direction"] == "outbound" and not self.outbound_policy()["enabled"]:
+            raise ServiceError(403, "outbound transfer is disabled by platform policy")
 
     def put_upload_part(self, upload_id: str, part_number: int, stream: BinaryIO, size: int,
                         claimed_sha256: str, actor: str, audit=None) -> Dict:
@@ -318,7 +320,7 @@ class SFSSService:
                 )
                 audited = (dict(audit) if audit is not None else {
                     "request_id":f"upload-part-{upload_id}-{part_number}", "actor":actor,
-                    "action":"upload.part.complete", "project_id":current["project_id"],
+                    "action":"upload.part.complete",
                     "object_id":upload_id, "outcome":"success", "source_zone":current["direction"],
                     "remote_addr":"local", "details":{}})
                 details = dict(audited.get("details") or {})
@@ -347,7 +349,7 @@ class SFSSService:
                 "UPDATE upload_sessions SET state='cancelled',updated_at=? WHERE id=? AND state='uploading'",
                 (int(time.time()), upload_id), error="upload session changed concurrently",
                 audit={"request_id":f"upload-cancelled-{upload_id}", "actor":actor,
-                       "action":"upload.session.cancelled", "project_id":session["project_id"],
+                       "action":"upload.session.cancelled",
                        "object_id":session.get("object_id"), "outcome":"success",
                        "source_zone":session["direction"], "remote_addr":"local",
                        "details":{"upload_id":upload_id, "direction":session["direction"]}})
@@ -429,7 +431,7 @@ class SFSSService:
             (object_id, int(time.time()), session["id"]),
             error="upload session could not be finalized",
             audit={"request_id":f"upload-completed-{session['id']}", "actor":"system",
-                   "action":"upload.session.completed", "project_id":session["project_id"],
+                   "action":"upload.session.completed",
                    "object_id":object_id, "outcome":"success", "source_zone":"isolation",
                    "remote_addr":"local", "details":{"upload_id":session["id"],
                    "direction":session["direction"]}})
@@ -438,6 +440,7 @@ class SFSSService:
         self._forget_upload_lock(session["id"])
 
     def _register_assembled_upload(self, session: Dict, assembled: Path, sha256: str, prefix: bytes) -> Dict:
+        self.require_workflow(session["direction"])
         detected = detect_content(prefix); conflict = extension_conflicts(session["filename"], detected)
         object_id = session.get("object_id")
         if not object_id: raise RuntimeError("upload session has no planned object identity")
@@ -447,12 +450,12 @@ class SFSSService:
             os.replace(str(assembled), str(target))
             try:
                 self.store.transaction_audited(((
-                    "INSERT INTO objects(id,project_id,uploader,filename,size,sha256,media_type,type_known,type_conflict,state,storage_path,created_at,updated_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (object_id, session["project_id"], session["actor"], session["filename"], session["total_size"], sha256,
+                    "INSERT INTO objects(id,uploader,filename,size,sha256,media_type,type_known,type_conflict,state,storage_path,created_at,updated_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (object_id, session["actor"], session["filename"], session["total_size"], sha256,
                      detected.media_type, int(detected.known), int(conflict), "pending_scan", str(target), now, now,
                      now + int(self.store.get_config("retention_seconds", str(self.settings.retention_seconds)))),
                 ),), audit={"request_id":f"object-registered-{object_id}", "actor":session["actor"],
-                            "action":"object.registered", "project_id":session["project_id"],
+                            "action":"object.registered",
                             "object_id":object_id, "outcome":"success", "source_zone":"isolation",
                             "remote_addr":"local", "details":{"upload_id":session["id"],
                             "sha256":sha256, "size":session["total_size"],
@@ -460,18 +463,18 @@ class SFSSService:
             except Exception:
                 shutil.rmtree(target_dir, ignore_errors=True); raise
             return self.get_object(object_id)
-        policy = self.outbound_policy(session["project_id"])
-        if not policy["enabled"]: raise ServiceError(403, "outbound transfer is disabled for this project")
+        policy = self.outbound_policy()
+        if not policy["enabled"]: raise ServiceError(403, "outbound transfer is disabled by platform policy")
         target_dir = self.outbound_isolation / object_id; target_dir.mkdir(mode=0o700); target = target_dir / "payload"
         os.replace(str(assembled), str(target))
         retention = now + int(self.store.get_config("retention_seconds", str(self.settings.retention_seconds)))
         try:
             self.store.transaction_audited(((
-                "INSERT INTO outbound_transfers(id,project_id,uploader,filename,size,sha256,media_type,type_known,type_conflict,state,storage_path,approval_provider,retention_expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (object_id, session["project_id"], session["actor"], session["filename"], session["total_size"], sha256,
+                "INSERT INTO outbound_transfers(id,uploader,filename,size,sha256,media_type,type_known,type_conflict,state,storage_path,approval_provider,retention_expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (object_id, session["actor"], session["filename"], session["total_size"], sha256,
                  detected.media_type, int(detected.known), int(conflict), "pending_scan", str(target), policy["approval_provider"], retention, now, now),
             ),), audit={"request_id":f"outbound-registered-{object_id}", "actor":session["actor"],
-                        "action":"outbound.registered", "project_id":session["project_id"],
+                        "action":"outbound.registered",
                         "object_id":object_id, "outcome":"success", "source_zone":"isolation",
                         "remote_addr":"local", "details":{"upload_id":session["id"],
                         "sha256":sha256, "size":session["total_size"],
@@ -480,99 +483,17 @@ class SFSSService:
             shutil.rmtree(target_dir, ignore_errors=True); raise
         return self.get_outbound(object_id)
 
-    def create_project(self, project_id: str, name: str, actor: str, audit=None):
-        if not self.store.is_global_admin(actor):
-            raise ServiceError(403, "global administrator required")
-        if not project_id or not project_id.replace("-", "").isalnum():
-            raise ServiceError(400, "invalid project id")
-        now = int(time.time())
-        try:
-            statements = (
-                ("INSERT INTO projects(id,name,created_at) VALUES(?,?,?)", (project_id, name, now)),
-                ("INSERT INTO memberships(project_id,username,role) VALUES(?,?,?)", (project_id, actor, "admin")),
-            )
-            if audit is None: self.store.transaction(statements)
-            else: self.store.transaction_audited(statements, audit=audit)
-        except sqlite3.IntegrityError as exc:
-            raise ServiceError(409, "project already exists or is invalid") from exc
-        return self.store.one("SELECT * FROM projects WHERE id=?", (project_id,))
-
-    def add_member(self, project_id: str, username: str, role: str, actor: str, audit=None):
-        inbound_roles = {"admin", "uploader", "downloader", "auditor"}
-        outbound_roles = {"red_uploader", "approver", "green_downloader"}
-        if role not in inbound_roles | outbound_roles:
-            raise ServiceError(400, "invalid role")
-        self.require_role(project_id, actor, {"admin"})
-        table = "memberships" if role in inbound_roles else "outbound_memberships"
-        statements = (
-            ("INSERT INTO users(username,global_admin,principal_type,enabled) VALUES(?,0,'human',1) "
-             "ON CONFLICT(username) DO NOTHING", (username,)),
-            (f"INSERT OR IGNORE INTO {table}(project_id,username,role) VALUES(?,?,?)",
-             (project_id, username, role)),
-        )
-        if audit is None: self.store.transaction(statements)
-        else: self.store.transaction_audited(statements, audit=audit)
-
-    def require_role(self, project_id: str, username: str, allowed: set):
-        project = self.store.one("SELECT archived FROM projects WHERE id=?", (project_id,))
-        if not project or project["archived"]:
-            raise ServiceError(404, "active project not found")
-        roles = self.store.roles(project_id, username)
-        if not roles.intersection(allowed):
-            raise ServiceError(403, "project permission denied")
-
-    def remove_member(self, project_id: str, username: str, role: str, actor: str, audit=None):
-        self.require_role(project_id, actor, {"admin"})
-        inbound_roles = {"admin", "uploader", "downloader", "auditor"}
-        outbound_roles = {"red_uploader", "approver", "green_downloader"}
-        if role not in inbound_roles | outbound_roles:
-            raise ServiceError(400, "invalid role")
-        table = "memberships" if role in inbound_roles else "outbound_memberships"
-        membership = self.store.one(
-            f"SELECT 1 AS present FROM {table} WHERE project_id=? AND username=? AND role=?",
-            (project_id, username, role),
-        )
-        if not membership:
-            raise ServiceError(404, "membership not found")
-        # The conditional delete evaluates the last-admin invariant in the same
-        # write transaction. Revoke all project tokens for a service principal:
-        # issued scopes must not outlive the role on which they were based.
-        delete = (
-            f"DELETE FROM {table} WHERE project_id=? AND username=? AND role=? "
-            "AND (? != 'admin' OR (SELECT COUNT(*) FROM memberships WHERE project_id=? AND role='admin')>1)",
-            (project_id, username, role, role, project_id),
-        )
-        statements = (delete, (
-            "UPDATE service_tokens SET revoked=1 WHERE project_id=? AND username=?", (project_id, username)))
-        try:
-            if audit is None:
-                self.store.transaction(statements, required_rows={0:1})
-            else:
-                self.store.transaction_audited(statements, audit=audit, required_rows={0:1})
-        except MutationConflictError as exc:
-            raise ServiceError(409, "cannot remove the last project administrator") from exc
-
-    def outbound_roles(self, project_id: str, username: str) -> set:
-        return {row["role"] for row in self.store.all(
-            "SELECT role FROM outbound_memberships WHERE project_id=? AND username=?", (project_id, username))}
-
-    def require_outbound_role(self, project_id: str, username: str, roles: set):
-        project = self.store.one("SELECT archived FROM projects WHERE id=?", (project_id,))
-        if not project or project["archived"]: raise ServiceError(404, "active project not found")
-        if not self.outbound_roles(project_id, username).intersection(roles):
-            raise ServiceError(403, "outbound project permission denied")
-
-    def outbound_policy(self, project_id: str) -> Dict:
-        row = self.store.one("SELECT * FROM outbound_policies WHERE project_id=?", (project_id,))
-        return row or {"project_id": project_id, "enabled": 0,
+    def outbound_policy(self) -> Dict:
+        self.require_workflow("outbound")
+        row = self.store.one("SELECT * FROM outbound_policy WHERE id=1")
+        return row or {"enabled": 0,
                        "allowed_classifications": '["GDS","FPGA_BITFILE","GENERAL"]',
                        "approval_provider": "local", "approval_timeout_hours": 72,
                        "download_ttl_hours": 168, "updated_at": 0, "updated_by": "system"}
 
-    def network_policy(self, project_id: str) -> Dict:
-        row = self.store.one("SELECT * FROM project_network_policies WHERE project_id=?", (project_id,))
-        return row or {"project_id": project_id,
-                       "inbound_upload_cidrs": '["127.0.0.1/32","::1/128"]',
+    def network_policy(self) -> Dict:
+        row = self.store.one("SELECT * FROM network_policy WHERE id=1")
+        return row or {"inbound_upload_cidrs": '["127.0.0.1/32","::1/128"]',
                        "outbound_upload_cidrs": '["127.0.0.1/32","::1/128"]',
                        "updated_at": 0, "updated_by": "system"}
 
@@ -592,33 +513,40 @@ class SFSSService:
             if canonical not in normalized: normalized.append(canonical)
         return normalized
 
-    def set_network_policy(self, project_id: str, data: Dict, actor: str, audit=None) -> Dict:
-        self.require_role(project_id, actor, {"admin"})
-        inbound = self.normalize_cidrs(data.get("inbound_upload_cidrs"))
-        outbound = self.normalize_cidrs(data.get("outbound_upload_cidrs"))
+    def set_network_policy(self, data: Dict, actor: str, audit=None) -> Dict:
+        if not self.store.is_global_admin(actor):
+            raise ServiceError(403, "platform administrator required")
+        current = self.network_policy()
+        inbound = (self.normalize_cidrs(data.get("inbound_upload_cidrs"))
+                   if self.workflow_enabled("inbound") else json.loads(current["inbound_upload_cidrs"]))
+        outbound = (self.normalize_cidrs(data.get("outbound_upload_cidrs"))
+                    if self.workflow_enabled("outbound") else json.loads(current["outbound_upload_cidrs"]))
         now = int(time.time())
-        statement = ("""INSERT INTO project_network_policies(project_id,inbound_upload_cidrs,outbound_upload_cidrs,updated_at,updated_by)
-          VALUES(?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET inbound_upload_cidrs=excluded.inbound_upload_cidrs,outbound_upload_cidrs=excluded.outbound_upload_cidrs,updated_at=excluded.updated_at,updated_by=excluded.updated_by""",
-          (project_id, json.dumps(inbound), json.dumps(outbound), now, actor))
+        statement = ("""INSERT INTO network_policy(id,inbound_upload_cidrs,outbound_upload_cidrs,updated_at,updated_by)
+          VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET inbound_upload_cidrs=excluded.inbound_upload_cidrs,outbound_upload_cidrs=excluded.outbound_upload_cidrs,updated_at=excluded.updated_at,updated_by=excluded.updated_by""",
+          (json.dumps(inbound), json.dumps(outbound), now, actor))
         if audit is None: self.store.transaction((statement,))
         else:
             audited = dict(audit); details = dict(audited.get("details") or {})
             details.update({"inbound_upload_cidrs":inbound, "outbound_upload_cidrs":outbound})
             audited["details"] = details
             self.store.transaction_audited((statement,), audit=audited)
-        return self.network_policy(project_id)
+        return self.network_policy()
 
-    def require_source_ip(self, project_id: str, direction: str, source_ip: str):
+    def require_source_ip(self, direction: str, source_ip: str):
+        self.require_workflow(direction)
         key = "inbound_upload_cidrs" if direction == "inbound" else "outbound_upload_cidrs"
-        policy = self.network_policy(project_id)
+        policy = self.network_policy()
         try: address = ipaddress.ip_address(source_ip)
         except ValueError as exc: raise ServiceError(403, "unrecognized source IP") from exc
         networks = [ipaddress.ip_network(value, strict=False) for value in json.loads(policy[key])]
         if not any(address.version == network.version and address in network for network in networks):
             raise ServiceError(403, f"source IP is not allowed for {direction} upload")
 
-    def set_outbound_policy(self, project_id: str, data: Dict, actor: str, audit=None) -> Dict:
-        self.require_role(project_id, actor, {"admin"})
+    def set_outbound_policy(self, data: Dict, actor: str, audit=None) -> Dict:
+        self.require_workflow("outbound")
+        if not self.store.is_global_admin(actor):
+            raise ServiceError(403, "platform administrator required")
         allowed = data.get("allowed_classifications", ["GDS", "FPGA_BITFILE", "GENERAL"])
         if not isinstance(allowed, list) or not allowed or not set(allowed).issubset({"GDS", "FPGA_BITFILE", "GENERAL"}):
             raise ServiceError(400, "invalid outbound classifications")
@@ -633,9 +561,9 @@ class SFSSService:
         except (TypeError, ValueError) as exc: raise ServiceError(400, "invalid policy duration") from exc
         if not 1 <= approval_hours <= 720 or not 1 <= download_hours <= 8760: raise ServiceError(400, "policy duration out of range")
         now = int(time.time())
-        statement = ("""INSERT INTO outbound_policies(project_id,enabled,allowed_classifications,approval_provider,approval_timeout_hours,download_ttl_hours,updated_at,updated_by)
-          VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET enabled=excluded.enabled,allowed_classifications=excluded.allowed_classifications,approval_provider=excluded.approval_provider,approval_timeout_hours=excluded.approval_timeout_hours,download_ttl_hours=excluded.download_ttl_hours,updated_at=excluded.updated_at,updated_by=excluded.updated_by""",
-          (project_id, int(bool(data.get("enabled", False))), json.dumps(allowed), provider, approval_hours, download_hours, now, actor))
+        statement = ("""INSERT INTO outbound_policy(id,enabled,allowed_classifications,approval_provider,approval_timeout_hours,download_ttl_hours,updated_at,updated_by)
+          VALUES(1,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled,allowed_classifications=excluded.allowed_classifications,approval_provider=excluded.approval_provider,approval_timeout_hours=excluded.approval_timeout_hours,download_ttl_hours=excluded.download_ttl_hours,updated_at=excluded.updated_at,updated_by=excluded.updated_by""",
+          (int(bool(data.get("enabled", False))), json.dumps(allowed), provider, approval_hours, download_hours, now, actor))
         if audit is None: self.store.transaction((statement,))
         else:
             audited = dict(audit); details = dict(audited.get("details") or {})
@@ -646,9 +574,10 @@ class SFSSService:
                             "download_ttl_hours":download_hours})
             audited["details"] = details
             self.store.transaction_audited((statement,), audit=audited)
-        return self.outbound_policy(project_id)
+        return self.outbound_policy()
 
     def outbound_transition(self, transfer_id: str, target: str, **fields):
+        self.require_workflow("outbound")
         current = self.get_outbound(transfer_id)
         if target not in OUTBOUND_TRANSITIONS[current["state"]]: raise RuntimeError(f"invalid outbound transition {current['state']} -> {target}")
         assignments = ["state=?", "updated_at=?"] + [f"{key}=?" for key in fields]
@@ -666,21 +595,23 @@ class SFSSService:
             f"UPDATE outbound_transfers SET {','.join(assignments)} WHERE id=? AND state=?", values,
             error="concurrent outbound state transition rejected",
             audit={"request_id":f"outbound-state-{transfer_id}-{target}", "actor":"system",
-                   "action":"outbound.state_changed", "project_id":current["project_id"],
+                   "action":"outbound.state_changed",
                    "object_id":transfer_id, "outcome":"success", "source_zone":"isolation",
                    "remote_addr":"local", "details":audit_details})
 
     def get_outbound(self, transfer_id: str) -> Dict:
+        self.require_workflow("outbound")
         row = self.store.one("SELECT * FROM outbound_transfers WHERE id=?", (transfer_id,))
         if not row: raise ServiceError(404, "outbound transfer not found")
         return row
 
-    def upload_outbound(self, project_id: str, filename: str, stream: BinaryIO, size: int, actor: str,
+    def upload_outbound(self, filename: str, stream: BinaryIO, size: int, actor: str,
                         audit=None) -> Dict:
-        self.require_outbound_role(project_id, actor, {"red_uploader"})
+        self.require_workflow("outbound")
+        self._require_active_user(actor)
         if not self._valid_filename(filename): raise ServiceError(400, "invalid filename")
-        policy = self.outbound_policy(project_id)
-        if not policy["enabled"]: raise ServiceError(403, "outbound transfer is disabled for this project")
+        policy = self.outbound_policy()
+        if not policy["enabled"]: raise ServiceError(403, "outbound transfer is disabled by platform policy")
         maximum = int(self.store.get_config("max_upload_bytes", str(self.settings.max_upload_bytes)))
         if size <= 0 or size > maximum: raise ServiceError(413, "invalid or excessive content length")
         self.require_storage_capacity(size)
@@ -696,12 +627,12 @@ class SFSSService:
             if written != size: raise ServiceError(400, "request body shorter than Content-Length")
             detected = detect_content(prefix); conflict = extension_conflicts(filename, detected); now = int(time.time())
             retention_expires = now + int(self.store.get_config("retention_seconds", str(self.settings.retention_seconds)))
-            statement = ("""INSERT INTO outbound_transfers(id,project_id,uploader,filename,size,sha256,media_type,type_known,type_conflict,state,storage_path,approval_provider,retention_expires_at,created_at,updated_at)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (transfer_id, project_id, actor, filename, size, digest.hexdigest(), detected.media_type,
+            statement = ("""INSERT INTO outbound_transfers(id,uploader,filename,size,sha256,media_type,type_known,type_conflict,state,storage_path,approval_provider,retention_expires_at,created_at,updated_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (transfer_id, actor, filename, size, digest.hexdigest(), detected.media_type,
               int(detected.known), int(conflict), "pending_scan", str(target), policy["approval_provider"], retention_expires, now, now))
             audited = (dict(audit) if audit is not None else {
                 "request_id":f"outbound-upload-{transfer_id}", "actor":actor,
-                "action":"outbound.upload", "project_id":project_id, "object_id":transfer_id,
+                "action":"outbound.upload", "object_id":transfer_id,
                 "outcome":"accepted", "source_zone":"red", "remote_addr":"local", "details":{}})
             audited["object_id"] = transfer_id
             details = dict(audited.get("details") or {})
@@ -720,7 +651,7 @@ class SFSSService:
         except RuntimeError:
             transfer = self.get_outbound(transfer_id)
             self.store.audit(request_id=f"outbound-duplicate-{transfer_id}", actor="system", action="outbound.scan.duplicate_ignored",
-              project_id=transfer["project_id"], object_id=transfer_id, outcome="ignored", source_zone="isolation",
+              object_id=transfer_id, outcome="ignored", source_zone="isolation",
               remote_addr="local", details={"state": transfer["state"]})
             return
         try:
@@ -748,7 +679,7 @@ class SFSSService:
                 self.audit_outbound_scan(transfer, "quarantined", details); return
             classification = self.outbound_classifier.classify(path, transfer["media_type"], bool(transfer["type_known"]))
             details.append({"scanner": self.outbound_classifier.name, "status": "clean" if classification.category else "error", "detail": classification.detail})
-            policy = self.outbound_policy(transfer["project_id"]); allowed = set(json.loads(policy["allowed_classifications"]))
+            policy = self.outbound_policy(); allowed = set(json.loads(policy["allowed_classifications"]))
             if not policy["enabled"] or not classification.category or classification.category not in allowed:
                 self.outbound_transition(transfer_id, "quarantined", classification=classification.category, scan_detail=json.dumps(details, sort_keys=True))
                 self.audit_outbound_scan(transfer, "quarantined", details); return
@@ -767,27 +698,28 @@ class SFSSService:
             finally:
                 current = self.get_outbound(transfer_id)
                 self.store.audit(request_id=f"outbound-scan-{transfer_id}", actor="system", action="outbound.scan.error",
-                  project_id=current["project_id"], object_id=transfer_id, outcome=current["state"], source_zone="isolation", remote_addr="local", details={"error":type(exc).__name__})
+                  object_id=transfer_id, outcome=current["state"], source_zone="isolation", remote_addr="local", details={"error":type(exc).__name__})
 
     def audit_outbound_scan(self, transfer: Dict, outcome: str, details):
         self.store.audit(request_id=f"outbound-scan-{transfer['id']}", actor="system", action="outbound.scan.complete",
-          project_id=transfer["project_id"], object_id=transfer["id"], outcome=outcome,
+          object_id=transfer["id"], outcome=outcome,
           source_zone="isolation", remote_addr="local", details={"results": details})
 
-    def decide_outbound(self, project_id: str, transfer_id: str, approved: bool, comment: str, actor: str) -> Dict:
-        self.require_outbound_role(project_id, actor, {"approver"}); transfer = self.get_outbound(transfer_id)
+    def decide_outbound(self, transfer_id: str, approved: bool, comment: str, actor: str) -> Dict:
+        if not (self.store.is_approver(actor) or self.store.is_global_admin(actor)):
+            raise ServiceError(403, "platform approver required")
+        transfer = self.get_outbound(transfer_id)
         if transfer["approval_provider"] != "local":
             raise ServiceError(403, "enterprise approval transfers cannot be decided locally")
-        return self._apply_outbound_decision(project_id, transfer, approved, comment, actor)
+        return self._apply_outbound_decision(transfer, approved, comment, actor)
 
-    def _apply_outbound_decision(self, project_id: str, transfer: Dict, approved: bool,
+    def _apply_outbound_decision(self, transfer: Dict, approved: bool,
                                  comment: str, actor: str) -> Dict:
         transfer_id = transfer["id"]
         comment = str(comment)
         if len(comment) > 1000: raise ServiceError(400, "approval comment is too long")
-        if transfer["project_id"] != project_id: raise ServiceError(404, "outbound transfer not found in project")
         if transfer["state"] != "pending_approval": raise ServiceError(409, "transfer is not pending approval")
-        policy = self.outbound_policy(project_id)
+        policy = self.outbound_policy()
         if (not policy["enabled"] or policy["approval_provider"] != transfer["approval_provider"] or
                 transfer["classification"] not in set(json.loads(policy["allowed_classifications"]))):
             raise ServiceError(409, "current outbound policy no longer permits this transfer")
@@ -805,6 +737,7 @@ class SFSSService:
         return self.release_approved_outbound(transfer_id)
 
     def process_approval_callback(self, event: Dict, payload_hash: str) -> Dict:
+        self.require_workflow("outbound")
         event_id = str(event.get("event_id", "")).strip()
         approval_id = str(event.get("approval_id", "")).strip()
         decision = str(event.get("status", "")).strip().lower()
@@ -845,8 +778,8 @@ class SFSSService:
                     raise ServiceError(409, "approval callback conflicts with an existing decision")
                 result = current
             else:
-                result = self._apply_outbound_decision(current["project_id"], current,
-                                                       decision == "approved", comment, callback_actor)
+                result = self._apply_outbound_decision(current, decision == "approved",
+                                                       comment, callback_actor)
             self.store.execute("UPDATE approval_callback_events SET outcome='processed' WHERE event_id=?", (event_id,))
             return {"status":"processed", "transfer":result}
         except Exception as exc:
@@ -859,7 +792,7 @@ class SFSSService:
         transfer = self.get_outbound(transfer_id)
         if transfer["state"] == "released_to_green": return transfer
         if transfer["state"] != "approved": raise ServiceError(409, "transfer has no durable approval decision")
-        policy = self.outbound_policy(transfer["project_id"])
+        policy = self.outbound_policy()
         if (not policy["enabled"] or policy["approval_provider"] != transfer["approval_provider"] or
                 transfer["classification"] not in set(json.loads(policy["allowed_classifications"]))):
             self.outbound_transition(transfer_id, "expired")
@@ -885,13 +818,14 @@ class SFSSService:
         self.outbound_transition(transfer_id, "released_to_green", download_expires_at=int(time.time()) + int(policy["download_ttl_hours"]) * 3600)
         return self.get_outbound(transfer_id)
 
-    def outbound_for_download(self, project_id: str, transfer_id: str, actor: str) -> Dict:
-        self.require_outbound_role(project_id, actor, {"green_downloader"}); transfer = self.get_outbound(transfer_id)
-        if transfer["project_id"] != project_id: raise ServiceError(404, "outbound transfer not found in project")
+    def outbound_for_download(self, transfer_id: str, actor: str) -> Dict:
+        transfer = self.get_outbound(transfer_id)
+        if transfer["uploader"] != actor and not self.store.is_global_admin(actor):
+            raise ServiceError(404, "outbound transfer not found")
         if transfer["state"] == "released_to_green" and transfer["download_expires_at"] <= int(time.time()): self.outbound_transition(transfer_id, "expired"); transfer = self.get_outbound(transfer_id)
         if transfer["state"] != "released_to_green": raise ServiceError(409, "outbound transfer is not released to green")
-        if not self.outbound_policy(project_id)["enabled"]:
-            raise ServiceError(409, "outbound downloads are disabled by current project policy")
+        if not self.outbound_policy()["enabled"]:
+            raise ServiceError(409, "outbound downloads are disabled by current platform policy")
         if not self._payload_integrity(transfer):
             self.outbound_transition(transfer_id, "expired")
             raise ServiceError(409, "outbound payload integrity verification failed")
@@ -912,6 +846,7 @@ class SFSSService:
         self.outbound_transition(transfer_id, "expired")
 
     def rescan(self, object_id: str):
+        self.require_workflow("inbound")
         obj = self.get_object(object_id)
         if obj["state"] != "quarantined":
             raise ServiceError(409, "only quarantined objects can be rescanned")
@@ -919,6 +854,7 @@ class SFSSService:
         self.queue.submit(self.scan_object, object_id)
 
     def expire_object(self, object_id: str):
+        self.require_workflow("inbound")
         obj = self.get_object(object_id)
         if obj["state"] == "expired":
             return
@@ -926,9 +862,10 @@ class SFSSService:
             raise ServiceError(409, "object cannot expire while scanning")
         self.transition(object_id, "expired")
 
-    def upload(self, project_id: str, filename: str, stream: BinaryIO, size: int, actor: str,
+    def upload(self, filename: str, stream: BinaryIO, size: int, actor: str,
                audit=None) -> Dict:
-        self.require_role(project_id, actor, {"admin", "uploader"})
+        self.require_workflow("inbound")
+        self._require_active_user(actor)
         if not self._valid_filename(filename): raise ServiceError(400, "invalid filename")
         max_upload_bytes = int(self.store.get_config("max_upload_bytes", str(self.settings.max_upload_bytes)))
         if size <= 0 or size > max_upload_bytes:
@@ -959,14 +896,14 @@ class SFSSService:
             conflict = extension_conflicts(filename, detected)
             now = int(time.time())
             statement = (
-                "INSERT INTO objects(id,project_id,uploader,filename,size,sha256,media_type,type_known,type_conflict,state,storage_path,created_at,updated_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (object_id, project_id, actor, filename, written, digest.hexdigest(), detected.media_type,
+                "INSERT INTO objects(id,uploader,filename,size,sha256,media_type,type_known,type_conflict,state,storage_path,created_at,updated_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (object_id, actor, filename, written, digest.hexdigest(), detected.media_type,
                  int(detected.known), int(conflict), "pending_scan", str(target), now, now,
                  now + int(self.store.get_config("retention_seconds", str(self.settings.retention_seconds)))),
             )
             audited = (dict(audit) if audit is not None else {
                 "request_id":f"object-upload-{object_id}", "actor":actor,
-                "action":"object.upload", "project_id":project_id, "object_id":object_id,
+                "action":"object.upload", "object_id":object_id,
                 "outcome":"accepted", "source_zone":"green", "remote_addr":"local", "details":{}})
             audited["object_id"] = object_id
             details = dict(audited.get("details") or {})
@@ -982,6 +919,7 @@ class SFSSService:
         return self.get_object(object_id)
 
     def transition(self, object_id: str, target: str, scan_detail=None):
+        self.require_workflow("inbound")
         current = self.get_object(object_id)
         if target not in ALLOWED_TRANSITIONS[current["state"]]:
             raise RuntimeError(f"invalid state transition {current['state']} -> {target}")
@@ -993,7 +931,7 @@ class SFSSService:
             (target, int(time.time()), detail, object_id, current["state"]),
             error="concurrent object state transition rejected",
             audit={"request_id":f"state-{object_id}-{target}", "actor":"system",
-                   "action":"object.state_changed", "project_id":current["project_id"],
+                   "action":"object.state_changed",
                    "object_id":object_id, "outcome":"success", "source_zone":"isolation",
                    "remote_addr":"local", "details":audit_details})
 
@@ -1003,7 +941,7 @@ class SFSSService:
         except RuntimeError:
             obj = self.get_object(object_id)
             self.store.audit(request_id=f"scan-duplicate-{object_id}", actor="system", action="scan.duplicate_ignored",
-                             project_id=obj["project_id"], object_id=object_id, outcome="ignored",
+                             object_id=object_id, outcome="ignored",
                              source_zone="isolation", remote_addr="local", details={"state": obj["state"]})
             return
         try:
@@ -1015,14 +953,14 @@ class SFSSService:
                             "detail":"production runtime configuration is not accepted"}]
                 self.transition(object_id, "quarantined", details)
                 self.store.audit(request_id=f"scan-{object_id}", actor="system", action="scan.complete",
-                                 project_id=obj["project_id"], object_id=object_id, outcome="quarantined",
+                                 object_id=object_id, outcome="quarantined",
                                  source_zone="isolation", remote_addr="local", details={"results":details})
                 return
             if not self._full_integrity(obj, path):
                 details = [{"scanner":"integrity","status":"error","detail":"payload changed after upload"}]
                 self.transition(object_id, "quarantined", details)
                 self.store.audit(request_id=f"scan-{object_id}", actor="system", action="scan.complete",
-                                 project_id=obj["project_id"], object_id=object_id, outcome="quarantined",
+                                 object_id=object_id, outcome="quarantined",
                                  source_zone="isolation", remote_addr="local", details={"results":details})
                 return
             results = [scanner.scan(path) for scanner in self.scanners]
@@ -1046,7 +984,7 @@ class SFSSService:
                 target = "released"
             self.transition(object_id, target, details)
             self.store.audit(request_id=f"scan-{object_id}", actor="system", action="scan.complete",
-                             project_id=obj["project_id"], object_id=object_id, outcome=target,
+                             object_id=object_id, outcome=target,
                              source_zone="isolation", remote_addr="local", details={"results": details})
         except Exception as exc:
             # Any pipeline exception is fail-closed. A scanning object remains inaccessible.
@@ -1057,20 +995,21 @@ class SFSSService:
             finally:
                 obj = self.get_object(object_id)
                 self.store.audit(request_id=f"scan-{object_id}", actor="system", action="scan.error",
-                                 project_id=obj["project_id"], object_id=object_id, outcome=obj["state"],
+                                 object_id=object_id, outcome=obj["state"],
                                  source_zone="isolation", remote_addr="local", details={"error": type(exc).__name__})
 
     def get_object(self, object_id: str) -> Dict:
+        self.require_workflow("inbound")
         obj = self.store.one("SELECT * FROM objects WHERE id=?", (object_id,))
         if not obj:
             raise ServiceError(404, "object not found")
         return obj
 
-    def object_for_download(self, project_id: str, object_id: str, actor: str) -> Dict:
-        self.require_role(project_id, actor, {"admin", "downloader"})
+    def object_for_download(self, object_id: str, actor: str) -> Dict:
+        self.require_workflow("inbound")
         obj = self.get_object(object_id)
-        if obj["project_id"] != project_id:
-            raise ServiceError(404, "object not found in project")
+        if obj["uploader"] != actor and not self.store.is_global_admin(actor):
+            raise ServiceError(404, "object not found")
         if obj["expires_at"] <= int(time.time()) and obj["state"] != "expired":
             self.transition(object_id, "expired")
             obj = self.get_object(object_id)
@@ -1122,9 +1061,13 @@ class SFSSService:
 
     def harden_existing_storage_permissions(self) -> Dict[str, int]:
         stats = {"sealed":0, "isolated":0, "invalid":0, "stale_parts_removed":0}
-        released_roots = (self.released.resolve(), self.outbound_released.resolve())
+        released_roots = tuple(root.resolve() for root in
+                               (([self.released] if self.workflow_enabled("inbound") else []) +
+                                ([self.outbound_released] if self.workflow_enabled("outbound") else [])))
         data_root = self.settings.data_dir.resolve()
-        for table in ("objects", "outbound_transfers"):
+        tables = ((["objects"] if self.workflow_enabled("inbound") else []) +
+                  (["outbound_transfers"] if self.workflow_enabled("outbound") else []))
+        for table in tables:
             for record in self.store.all(f"SELECT * FROM {table} WHERE storage_path!=''"):
                 path = Path(record["storage_path"]).resolve()
                 try: inside = os.path.commonpath((str(data_root), str(path))) == str(data_root)
@@ -1175,6 +1118,7 @@ class SFSSService:
                            (stat.st_mtime_ns, stat.st_ctime_ns, object_id))
 
     def expire_due(self) -> int:
+        if not self.workflow_enabled("inbound"): return 0
         now = int(time.time())
         due = self.store.all("SELECT id,state FROM objects WHERE expires_at<=? AND state IN ('pending_scan','quarantined','released','rejected')", (now,))
         for obj in due:
@@ -1192,14 +1136,14 @@ class SFSSService:
             "DELETE FROM auth_sessions WHERE revoked=1 OR expires_at<=?", (now,),
             audit_factory=lambda count: {
                 "request_id":f"maintenance-session-purge-{now}", "actor":"system",
-                "action":"session.records_purged", "project_id":None, "object_id":None,
+                "action":"session.records_purged", "object_id":None,
                 "outcome":"success", "source_zone":"maintenance", "remote_addr":"local",
                 "details":{"purged":count, "criteria":"revoked_or_expired"}})
         stats["service_tokens_expired"] = self.store.execute_audited_counted(
             "UPDATE service_tokens SET revoked=1 WHERE revoked=0 AND expires_at<=?", (now,),
             audit_factory=lambda count: {
                 "request_id":f"maintenance-service-token-expiry-{now}", "actor":"system",
-                "action":"service_token.expired", "project_id":None, "object_id":None,
+                "action":"service_token.expired", "object_id":None,
                 "outcome":"success", "source_zone":"maintenance", "remote_addr":"local",
                 "details":{"revoked":count, "criteria":"expires_at"}})
         stats["integration_nonces_purged"] = self.store.execute(
@@ -1216,7 +1160,7 @@ class SFSSService:
                         "WHERE id=? AND state IN ('uploading','completing')",
                         (now, upload["id"]), error="upload session changed during expiry",
                         audit={"request_id":f"upload-expired-{upload['id']}", "actor":"system",
-                               "action":"upload.session.expired", "project_id":upload["project_id"],
+                               "action":"upload.session.expired",
                                "object_id":upload.get("object_id"), "outcome":"success",
                                "source_zone":"maintenance", "remote_addr":"local",
                                "details":{"upload_id":upload["id"],
@@ -1228,17 +1172,21 @@ class SFSSService:
                 except RuntimeError:
                     continue
         scan_cutoff = now - max(60, self.settings.scan_timeout_seconds)
-        for obj in self.store.all("SELECT id FROM objects WHERE state='scanning' AND updated_at<=?", (scan_cutoff,)):
-            self.transition(obj["id"], "quarantined", [{"scanner":"maintenance","status":"error","detail":"scan timeout"}])
-        for transfer in self.store.all(
+        if self.workflow_enabled("inbound"):
+            for obj in self.store.all("SELECT id FROM objects WHERE state='scanning' AND updated_at<=?", (scan_cutoff,)):
+                self.transition(obj["id"], "quarantined", [{"scanner":"maintenance","status":"error","detail":"scan timeout"}])
+        outbound_rows = self.store.all(
                 "SELECT id,state FROM outbound_transfers WHERE state IN ('scanning','classified') AND updated_at<=?",
-                (scan_cutoff,)):
+                (scan_cutoff,)) if self.workflow_enabled("outbound") else []
+        for transfer in outbound_rows:
             detail = ("scan timeout" if transfer["state"] == "scanning" else
                       "approval submission interrupted after classification")
             self.outbound_transition(
                 transfer["id"], "quarantined",
                 scan_detail=json.dumps([{"scanner":"maintenance", "status":"error", "detail":detail}]))
-        for transfer in self.store.all("SELECT id FROM outbound_transfers WHERE state='approved'"):
+        approved_rows = (self.store.all("SELECT id FROM outbound_transfers WHERE state='approved'")
+                         if self.workflow_enabled("outbound") else [])
+        for transfer in approved_rows:
             try:
                 self.release_approved_outbound(transfer["id"]); stats["approved_release_retried"] += 1
             except ServiceError:
@@ -1247,19 +1195,21 @@ class SFSSService:
           (state='pending_approval' AND approval_expires_at IS NOT NULL AND approval_expires_at<=?) OR
           (state='released_to_green' AND download_expires_at IS NOT NULL AND download_expires_at<=?) OR
           (state IN ('pending_scan','quarantined','approved','approval_rejected') AND retention_expires_at IS NOT NULL AND retention_expires_at<=?)""",
-          (now, now, now))
+          (now, now, now)) if self.workflow_enabled("outbound") else []
         for transfer in outbound_due:
             self.expire_outbound(transfer["id"]); stats["outbound_expired"] += 1
         cutoff = now - max(0, self.settings.purge_grace_seconds)
-        for table, action in (("objects", "object.payload_purged"), ("outbound_transfers", "outbound.payload_purged")):
-            rows = self.store.all(f"SELECT id,project_id,storage_path FROM {table} WHERE state='expired' AND updated_at<=? AND storage_path!=''", (cutoff,))
+        purge_tables = (([("objects", "object.payload_purged")] if self.workflow_enabled("inbound") else []) +
+                        ([("outbound_transfers", "outbound.payload_purged")] if self.workflow_enabled("outbound") else []))
+        for table, action in purge_tables:
+            rows = self.store.all(f"SELECT id,storage_path FROM {table} WHERE state='expired' AND updated_at<=? AND storage_path!=''", (cutoff,))
             for row in rows:
                 self._purge_payload(row["storage_path"])
                 self.store.execute_audited(
                     f"UPDATE {table} SET storage_path='' WHERE id=?", (row["id"],),
                     error="expired payload record disappeared during purge",
                     audit={"request_id":f"purge-{row['id']}", "actor":"system", "action":action,
-                           "project_id":row["project_id"], "object_id":row["id"],
+                           "object_id":row["id"],
                            "outcome":"success", "source_zone":"maintenance",
                            "remote_addr":"local", "details":{}})
                 stats["payloads_purged"] += 1
@@ -1305,7 +1255,7 @@ class SFSSService:
                 "WHERE id=? AND state='completing'", (int(time.time()), session["id"]),
                 error="interrupted upload completion changed during recovery",
                 audit={"request_id":f"upload-reset-{session['id']}", "actor":"system",
-                       "action":"upload.session.completion_reset", "project_id":session["project_id"],
+                       "action":"upload.session.completion_reset",
                        "object_id":object_id, "outcome":"quarantined", "source_zone":"startup",
                        "remote_addr":"local", "details":{"upload_id":session["id"],
                        "direction":session["direction"], "reason":"object registration incomplete"}})
@@ -1317,20 +1267,28 @@ class SFSSService:
                 shutil.rmtree(staging, ignore_errors=True)
                 stats["terminal_upload_staging_cleaned"] += 1
             self.store.execute("DELETE FROM upload_parts WHERE upload_id=?", (session["id"],))
-        for obj in self.store.all("SELECT id FROM objects WHERE state='scanning'"):
+        inbound_scanning = (self.store.all("SELECT id FROM objects WHERE state='scanning'")
+                            if self.workflow_enabled("inbound") else [])
+        for obj in inbound_scanning:
             self.transition(obj["id"], "quarantined", [{"scanner":"startup","status":"error","detail":"scan interrupted by service restart"}])
             stats["interrupted_quarantined"] += 1
-        for transfer in self.store.all(
-                "SELECT id,state FROM outbound_transfers WHERE state IN ('scanning','classified')"):
+        outbound_scanning = (self.store.all(
+                "SELECT id,state FROM outbound_transfers WHERE state IN ('scanning','classified')")
+                if self.workflow_enabled("outbound") else [])
+        for transfer in outbound_scanning:
             detail = ("scan interrupted by service restart" if transfer["state"] == "scanning" else
                       "approval submission interrupted after classification")
             self.outbound_transition(
                 transfer["id"], "quarantined",
                 scan_detail=json.dumps([{"scanner":"startup", "status":"error", "detail":detail}]))
             stats["interrupted_quarantined"] += 1
-        for obj in self.store.all("SELECT id FROM objects WHERE state='pending_scan'"):
+        inbound_pending = (self.store.all("SELECT id FROM objects WHERE state='pending_scan'")
+                           if self.workflow_enabled("inbound") else [])
+        for obj in inbound_pending:
             self.queue.submit(self.scan_object, obj["id"]); stats["inbound_requeued"] += 1
-        for transfer in self.store.all("SELECT id FROM outbound_transfers WHERE state='pending_scan'"):
+        outbound_pending = (self.store.all("SELECT id FROM outbound_transfers WHERE state='pending_scan'")
+                            if self.workflow_enabled("outbound") else [])
+        for transfer in outbound_pending:
             self.queue.submit(self.scan_outbound, transfer["id"]); stats["outbound_requeued"] += 1
         return stats
 

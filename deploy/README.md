@@ -4,18 +4,33 @@ This directory is a hardened deployment **template**, not a production security 
 
 Use [the four-zone architecture and firewall matrix](../docs/FOUR_ZONE_ARCHITECTURE.md) as the network-review baseline and [security traceability](../docs/SECURITY_TRACEABILITY.md) to distinguish repository controls from evidence that must be collected in the target environment.
 
+## Two-system split deployment
+
+Production **must** run SFSS as two independently deployed single-purpose systems, selected with `SFSS_DEPLOYMENT_MODE`:
+
+- **System 1 — inbound (`SFSS_DEPLOYMENT_MODE=inbound`)**: 绿区上传 → isolation → scanning → release → 红区下载 (red read-only download). It uses `sfss-inbound.env.example`, `systemd/sfss-inbound.service`, data tree `/srv/sfss-inbound`, socket `/run/sfss-inbound/sfss.sock`, blue core `nginx/blue-core-inbound.conf`, and the `green-inbound.conf` / `red-inbound.conf` / `admin-inbound.conf` gateways.
+- **System 2 — outbound (`SFSS_DEPLOYMENT_MODE=outbound`)**: 红区上传 → isolation → scanning → classification → approval (WeCom relay) → released-green buffer → 绿区下载. It uses `sfss-outbound.env.example`, `systemd/sfss-outbound.service`, data tree `/srv/sfss-outbound`, socket `/run/sfss-outbound/sfss.sock`, blue core `nginx/blue-core-outbound.conf`, and the `red-outbound.conf` / `green-outbound.conf` / `admin-outbound.conf` gateways. The approval-relay callback is exposed only on this system's management gateway.
+
+Each system is a complete, separately hardened SFSS instance: its own database, its own project/member provisioning, its own LDAP binding and admin entrance, its own tokens, its own audit chain, and its own Unix socket. The split is enforced end to end, not just by routing:
+
+- Startup validation rejects `combined` mode in production and rejects a database that contains records of the other workflow (`_validate_deployment_database_scope`), so a data directory can never be shared or migrated between systems without failing closed.
+- Every route, service method, upload session, network-policy direction, scan job kind, project role, and service-token scope of the non-deployed workflow returns 404/400 at that system; the durable scan queue is constructed with only the deployed job kind.
+- Zone gateways of each system only expose the method-allowlisted routes of that workflow, so the other direction is unreachable at the edge as well as the core.
+
+The single-system `sfss.env.example`, `systemd/sfss.service`, `blue-core.conf`, and the combined `green/red/admin.conf` gateways remain for local development and evaluation only; production rejects `SFSS_DEPLOYMENT_MODE=combined`. Run each system's initialize/fingerprint/preflight drill independently against its own data directory, and never share `/etc/sfss` secret files, credentials, or HMAC keys between the two systems.
+
 ## Placement
 
-- Green zone: `nginx/green.conf`, exposing only `/green` and green data operations.
-- Yellow zone red-side portal: `nginx/red.conf`, exposing only `/red`, released inbound downloads, and outbound uploads.
-- Yellow management network: `nginx/admin.conf`, restricted to management source CIDRs.
-- Yellow/internal integration network: deploy a separately reviewed WeCom approval relay; only it holds WeCom credentials and Internet/API reachability.
-- Blue exchange zone: `nginx/blue-core.conf`, the only TLS/mTLS ingress to the SFSS core; SFSS accepts HTTP only through `/run/sfss/sfss.sock`.
-- Red zone: install the `sfss-agent` CLI with a red-agent service identity and client certificate. It pulls released inbound objects and pushes outbound objects; it receives no Internet route.
+- Green zone: System 1 `nginx/green-inbound.conf` (inbound uploads only); System 2 `nginx/green-outbound.conf` (approved outbound downloads only).
+- Yellow zone red-side portals: System 1 `nginx/red-inbound.conf` (released inbound downloads); System 2 `nginx/red-outbound.conf` (outbound uploads and status).
+- Yellow management network: `nginx/admin-inbound.conf` and `nginx/admin-outbound.conf`, restricted to management source CIDRs.
+- Yellow/internal integration network: deploy a separately reviewed WeCom approval relay; only it holds WeCom credentials and Internet/API reachability. It talks only to the outbound system.
+- Blue exchange zone: `nginx/blue-core-inbound.conf` and `nginx/blue-core-outbound.conf`, the only TLS/mTLS ingress to each SFSS core; cores accept HTTP only through their `/run/sfss-{inbound,outbound}/sfss.sock` sockets.
+- Red zone: install the `sfss-agent` CLI with red-agent service identities and client certificates. It pulls released inbound objects from System 1 and pushes outbound objects to System 2; it receives no Internet route.
 
-There is no green-to-red route. Gateway-to-blue traffic uses mTLS. The blue Nginx proxy is the only process allowed to connect to the SFSS application socket and overwrites forwarding metadata before passing it to SFSS.
+There is no green-to-red route. Gateway-to-blue traffic uses mTLS. Each blue Nginx proxy is the only process allowed to connect to its SFSS application socket and overwrites forwarding metadata before passing it to SFSS. An independent gateway CA per system is encouraged so a compromised gateway certificate cannot reach the other system's blue core.
 
-Production startup forbids every TCP application listener and accepts only an absolute Unix socket directly below `/run/sfss`. The socket is created mode `0660`; systemd owns its parent runtime directory mode `0750`, and shutdown removes only the exact socket inode created by that process. Add the blue Nginx worker identity to the `sfss` group so it can traverse the runtime directory and connect, but keep `/srv/sfss` mode `0700` so group membership does not grant data access. Do not widen socket permissions as a convenience; scale-out requires the reviewed HA service/data architecture and an equivalent authenticated workload boundary.
+Production startup forbids every TCP application listener and accepts only an absolute Unix socket directly below the runtime directory of its deployment mode (`/run/sfss-inbound` or `/run/sfss-outbound`; `/run/sfss` is for the development combined mode). The socket is created mode `0660`; systemd owns its parent runtime directory mode `0750`, and shutdown removes only the exact socket inode created by that process. Add the blue Nginx worker identity to the `sfss` group so it can traverse the runtime directory and connect, but keep the data tree mode `0700` so group membership does not grant data access. Do not widen socket permissions as a convenience; scale-out requires the reviewed HA service/data architecture and an equivalent authenticated workload boundary.
 
 Green and red gateway templates also enforce an HTTP method allowlist per route before traffic reaches blue. Green permits inbound upload creation/parts and approved outbound reads; red permits released inbound reads and outbound upload creation/parts. This is defense in depth—the SFSS core independently repeats zone, gateway-role, project-role, token-scope, and method checks.
 
@@ -31,8 +46,8 @@ At minimum, alert on `/ready` returning non-200, any `sfss_scanner_up` value of 
 2. Build the SFSS wheel in a controlled build environment. From the approved internal artifact mirror, install `requirements-production.txt` first and then install the wheel with `--no-deps` into `/opt/sfss/venv`; install the reviewed OS-packaged `yara` CLI for the production adapter. The requirements file permits only wheels, pins `ldap3` and `pyasn1`, and verifies their PyPI SHA-256 hashes. Do not give a blue-zone runtime host direct PyPI access.
 3. Generate independent client certificates for the green, yellow-red, and yellow-admin gateways. Their subject common names must be exactly `sfss-green-gateway`, `sfss-red-gateway`, and `sfss-admin-gateway`, matching `nginx/blue-core.conf`. Configure the blue proxy to trust only the gateway CA. Install current CRLs as `/etc/sfss/tls/zone-gateway-ca.crl.pem` on blue and `/etc/sfss/tls/blue-ca.crl.pem` on every gateway. The blue proxy derives zone and gateway role from the verified, non-revoked certificate subject; it never trusts an incoming zone header.
 4. Generate the manifest and approval-relay HMAC secrets using at least 32 random bytes from the organization's secrets manager. Materialize each as a different absolute mode-`0600` regular file and configure the corresponding `*_FILE` variables. Production rejects raw environment HMAC values, links, special files, group/other permissions, short files, control characters, and a file whose current content differs from the startup-loaded value. Independently record the LDAP CA, approval-relay CA, and approval-relay client-certificate digests in their `*_SHA256` settings; startup hashes them safely and runtime identity drift closes the data plane. LDAP CA drift additionally disables login even though bounded recovery login normally remains available. Do not place secrets in source control or the environment file.
-5. Copy `sfss.env.example` to `/etc/sfss/sfss.env`, mode `0600`, and replace all network/LDAP/rule settings. Set `SFSS_RELEASE_ID` to the signed immutable build identifier and `SFSS_EXPECTED_PYTHON_VERSION` to the exact `major.minor.patch` runtime from a currently supported Python 3.12-or-newer branch; startup rejects an older branch or mismatch. Python 3.9 reached end of life on 2025-10-31 and is not a production option.
-6. Install `systemd/sfss.service`, then install the four Nginx configurations on their corresponding hosts.
+5. Copy `sfss-inbound.env.example` and `sfss-outbound.env.example` to `/etc/sfss/sfss-inbound.env` and `/etc/sfss/sfss-outbound.env`, mode `0600`, and replace all network/LDAP/rule settings in each. Use separate secret files, gateway credentials, and LDAP bindings for the two systems. Set `SFSS_RELEASE_ID` to the signed immutable build identifier and `SFSS_EXPECTED_PYTHON_VERSION` to the exact `major.minor.patch` runtime from a currently supported Python 3.12-or-newer branch; startup rejects an older branch or mismatch. Python 3.9 reached end of life on 2025-10-31 and is not a production option.
+6. Install `systemd/sfss-inbound.service` and `systemd/sfss-outbound.service` on their corresponding blue hosts, then install the split Nginx configurations on their corresponding hosts.
 7. Confirm no process is listening on application TCP port 8080. Only blue Nginx's explicitly authorized group may connect to `/run/sfss/sfss.sock`; only certificate-authenticated zone gateways may reach blue Nginx `8443`.
 8. Run the full test suite, backup/restore drill, EICAR rejection, YARA test rule, large-file interruption test, and firewall bypass test before release.
 
@@ -50,15 +65,15 @@ For a new data directory, initialize the schema without listening on a port, cal
 
 ```sh
 set -a
-. /etc/sfss/sfss.env
+. /etc/sfss/sfss-inbound.env
 set +a
-/opt/sfss/venv/bin/sfss-admin initialize --data-dir /srv/sfss
-/opt/sfss/venv/bin/sfss-admin config-fingerprint --data-dir /srv/sfss
+/opt/sfss/venv/bin/sfss-admin initialize --data-dir /srv/sfss-inbound
+/opt/sfss/venv/bin/sfss-admin config-fingerprint --data-dir /srv/sfss-inbound
 # Update SFSS_EXPECTED_CONFIG_SHA256 in the controlled environment file, then reload it.
 /opt/sfss/venv/bin/sfss-admin preflight
 ```
 
-`initialize` refuses an existing database. The fingerprint excludes raw credentials/HMAC values but includes their configured file paths, every other effective setting, and persisted administrator-editable system configuration. Any later setting/configuration change makes startup or `/ready` fail until an authorized change process records the new fingerprint. A running production process also blocks data-plane requests, callbacks, scans, and approved promotion on drift; only observability and tightly bounded rollback/credential-containment routes remain. Do not bypass this 503 gate. Stop intake, review the audited change, restore the accepted values or approve a new fingerprint through change control, run preflight, and restart. The preflight command exits nonzero unless production configuration, runtime/release identity, fingerprint, read-only data/audit/payload verification, persisted identity/approval policy, scanner health, disk reserve, the LDAP client package, and an authenticated LDAPS TLS handshake all pass. Archive the JSON result with the release evidence. The LDAPS check validates connectivity and the server certificate but deliberately does not store or exercise a user's password; a separately controlled real bind/login test is still required.
+Repeat the same drill for the outbound system with `/etc/sfss/sfss-outbound.env` and `/srv/sfss-outbound`. `initialize` refuses an existing database. The fingerprint excludes raw credentials/HMAC values but includes their configured file paths, every other effective setting (including `SFSS_DEPLOYMENT_MODE`), and persisted administrator-editable system configuration. Any later setting/configuration change makes startup or `/ready` fail until an authorized change process records the new fingerprint. A running production process also blocks data-plane requests, callbacks, scans, and approved promotion on drift; only observability and tightly bounded rollback/credential-containment routes remain. Do not bypass this 503 gate. Stop intake, review the audited change, restore the accepted values or approve a new fingerprint through change control, run preflight, and restart. The preflight command exits nonzero unless production configuration, runtime/release identity, fingerprint, read-only data/audit/payload verification, persisted identity/approval policy, scanner health, disk reserve, the LDAP client package, and an authenticated LDAPS TLS handshake all pass. Archive the JSON result with the release evidence. The LDAPS check validates connectivity and the server certificate but deliberately does not store or exercise a user's password; a separately controlled real bind/login test is still required.
 
 The preflight records installed LDAP dependency versions. `ldap3` 2.9.1 is the latest stable release currently published on PyPI, but its age is itself a review concern, not a security endorsement. Run an approved software-composition/vulnerability scan on the exact wheel set and review the project's maintenance status before each release. A future version or alternate LDAP client must go through compatibility, AD, fail-closed, and thread-safety testing before updating the lock.
 
@@ -82,7 +97,7 @@ SIGTERM triggers graceful shutdown: the core stops accepting requests, wakes the
 
 ## Transfer Agent identities and token rotation
 
-Create a different non-interactive SFSS service identity for each project, zone, and operational direction. Assign only the matching project role, then issue the narrowest token from the administrator configuration page. Never issue an Agent token to a human LDAP identity and never reuse an interactive bearer session in automation.
+Create a different non-interactive SFSS service identity for each project, zone, and operational direction. Identities and tokens are per-system: green inbound senders and red inbound receivers exist only on the inbound system; red outbound senders and green outbound receivers exist only on the outbound system. Point each Agent at the DNS name of the matching system's zone gateway. Assign only the matching project role, then issue the narrowest token from the administrator configuration page. Never issue an Agent token to a human LDAP identity and never reuse an interactive bearer session in automation.
 
 Set `SFSS_AGENT_PRODUCTION=true` (or pass `--production`) in every managed invocation. The production Agent refuses raw token/HMAC environment or command-line values, plain HTTP, missing CA/mTLS identity, unsigned downloads, and output overwrite. Treat a failure of this gate as a deployment error rather than removing the flag.
 
@@ -102,12 +117,14 @@ Size `SFSS_AGENT_TIMEOUT_SECONDS` from the slowest approved link and multipart c
 The service holds an exclusive lock on its data directory and refuses a second runtime. Backups deliberately require downtime so SQLite, upload state, payloads, and the audit-chain head are one consistent set.
 
 ```sh
-systemctl stop sfss
-/opt/sfss/venv/bin/sfss-admin verify --data-dir /srv/sfss
-/opt/sfss/venv/bin/sfss-admin export-audit --data-dir /srv/sfss --output /secure-staging/sfss-audit-$(date +%F).jsonl
-/opt/sfss/venv/bin/sfss-admin backup --data-dir /srv/sfss --output /secure-staging/sfss-$(date +%F).tar
-systemctl start sfss
+systemctl stop sfss-inbound
+/opt/sfss/venv/bin/sfss-admin verify --data-dir /srv/sfss-inbound
+/opt/sfss/venv/bin/sfss-admin export-audit --data-dir /srv/sfss-inbound --output /secure-staging/sfss-inbound-audit-$(date +%F).jsonl
+/opt/sfss/venv/bin/sfss-admin backup --data-dir /srv/sfss-inbound --output /secure-staging/sfss-inbound-$(date +%F).tar
+systemctl start sfss-inbound
 ```
+
+Run the same drill against the outbound system with its own unit, data directory, and outputs.
 
 The audit export is canonical JSONL: each line contains the exact database event plus its previous and current chain hashes. Record the reported event count, chain head, and file SHA-256, then ingest the file into the approved immutable/WORM audit platform. The local export is evidence for that handoff; it is not itself immutable storage.
 

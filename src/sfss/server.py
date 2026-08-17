@@ -111,14 +111,14 @@ def ip_in_cidrs(address: str, configured: str) -> bool:
 
 def public_object(obj):
     return {key: obj[key] for key in (
-        "id", "project_id", "uploader", "filename", "size", "sha256", "media_type",
+        "id", "uploader", "filename", "size", "sha256", "media_type",
         "type_known", "type_conflict", "state", "created_at", "updated_at", "expires_at",
         "scan_detail",
     )}
 
 
 def public_outbound(obj):
-    keys = ("id", "project_id", "uploader", "filename", "size", "sha256", "media_type",
+    keys = ("id", "uploader", "filename", "size", "sha256", "media_type",
             "type_known", "type_conflict", "classification", "state", "scan_detail",
             "approval_provider", "approval_id", "approval_actor", "approval_comment", "created_at",
             "updated_at", "approval_expires_at", "download_expires_at")
@@ -127,7 +127,7 @@ def public_outbound(obj):
 
 def public_upload(session):
     return {key: session.get(key) for key in (
-        "id", "project_id", "actor", "direction", "filename", "total_size", "chunk_size",
+        "id", "actor", "direction", "filename", "total_size", "chunk_size",
         "expected_sha256", "state", "object_id", "created_at", "updated_at", "expires_at",
         "parts", "received_bytes", "part_count",
     )}
@@ -135,7 +135,7 @@ def public_upload(session):
 
 def public_service_token(record):
     return {"id":record["id"], "label":record["label"], "username":record["username"],
-            "project_id":record["project_id"], "zone":record["zone"],
+            "zone":record["zone"],
             "permissions":json.loads(record["permissions"]), "created_at":record["created_at"],
             "expires_at":record["expires_at"], "last_used_at":record.get("last_used_at"),
             "created_by":record["created_by"], "revoked":bool(record["revoked"])}
@@ -365,7 +365,7 @@ def make_handler(service: SFSSService, authenticator):
                 self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(record["filename"], safe=""))
                 self.send_header("Accept-Ranges", "bytes")
                 self.send_header("ETag", etag)
-                manifest = f'{record["id"]}\n{record["project_id"]}\n{size}\n{record["sha256"]}'
+                manifest = f'{record["id"]}\n{size}\n{record["sha256"]}'
                 if service.settings.manifest_hmac_key:
                     signature = hmac.new(service.settings.manifest_hmac_key.encode(), manifest.encode(), hashlib.sha256).hexdigest()
                     self.send_header("X-SFSS-Manifest-Signature", signature)
@@ -467,11 +467,7 @@ def make_handler(service: SFSSService, authenticator):
                 management_route = (
                     path == ["admin"] or path[:2] == ["v1", "admin"] or
                     path in (["ready"], ["metrics"], ["v1", "integrations", "wecom", "callback"]) or
-                    (method == "POST" and path == ["v1", "projects"]) or
-                    (len(path) >= 4 and path[:2] == ["v1", "projects"] and path[3] in
-                     {"members", "outbound-policy", "network-policy", "audit"}) or
-                    (len(path) == 6 and path[:2] == ["v1", "projects"] and
-                     path[3] == "outbound" and path[5] == "decision")
+                    (len(path) == 4 and path[:2] == ["v1", "outbound"] and path[3] == "decision")
                 )
                 if management_route and role != "admin":
                     raise ServiceError(403, "operation is available only through the management gateway")
@@ -512,48 +508,52 @@ def make_handler(service: SFSSService, authenticator):
                 return
             raise ServiceError(503, "production runtime configuration is not in the accepted state")
 
-        def audit(self, actor, action, outcome, project_id=None, object_id=None, details=None):
-            service.store.audit(**self.audit_payload(actor, action, outcome, project_id, object_id, details))
+        def audit(self, actor, action, outcome, object_id=None, details=None):
+            service.store.audit(**self.audit_payload(actor, action, outcome, object_id, details))
 
-        def audit_payload(self, actor, action, outcome, project_id=None, object_id=None, details=None):
+        def audit_payload(self, actor, action, outcome, object_id=None, details=None):
             context = dict(details or {})
             identity = getattr(self, "_identity", None)
             if identity and identity.credential_type == "service":
                 context.update({"credential_type":"service", "service_token_id":identity.token_id})
             return {"request_id":self.request_id, "actor":actor, "action":action,
-                    "project_id":project_id, "object_id":object_id, "outcome":outcome,
+                    "object_id":object_id, "outcome":outcome,
                     "source_zone":self.zone(), "remote_addr":self.client_ip(),
                     "details":context}
 
-        def require_service_permission(self, identity, permission: str, project_id: str):
+        def require_service_permission(self, identity, permission: str):
             if identity.credential_type != "service": return
-            if identity.project_id != project_id or identity.zone != self.zone() or permission not in identity.permissions:
+            if identity.zone != self.zone() or permission not in identity.permissions:
                 raise ServiceError(403, "service token scope does not permit this operation")
 
         def enforce_service_scope(self, method: str, path, identity):
             if identity.credential_type != "service": return
             if self.zone() != identity.zone:
                 raise ServiceError(403, "service token is bound to a different zone")
-            if method == "GET" and path in (["v1", "me"], ["v1", "projects"]): return
+            if method == "GET" and path in (["v1", "me"], ["v1", "objects"], ["v1", "outbound"]): return
             if path[:2] == ["v1", "uploads"] and len(path) >= 3:
-                session = service.store.one("SELECT project_id,direction FROM upload_sessions WHERE id=?", (path[2],))
+                session = service.store.one("SELECT actor,direction FROM upload_sessions WHERE id=?", (path[2],))
                 if not session: raise ServiceError(404, "upload session not found")
+                if session["actor"] != identity.username:
+                    raise ServiceError(403, "service token does not own this upload session")
                 permission = "inbound_upload" if session["direction"] == "inbound" else "outbound_upload"
-                self.require_service_permission(identity, permission, session["project_id"]); return
-            if len(path) >= 4 and path[:2] == ["v1", "projects"]:
-                project_id, resource = path[2], path[3]
-                if resource == "uploads" and method == "POST":
-                    allowed = ({"inbound_upload"} if identity.zone == "green" else {"outbound_upload"})
-                    if identity.project_id == project_id and allowed.intersection(identity.permissions): return
-                if resource == "objects":
-                    permission = "inbound_download" if identity.zone == "red" else "inbound_upload"
-                    if len(path) == 6 and path[5] == "download": permission = "inbound_download"
-                    self.require_service_permission(identity, permission, project_id); return
-                if resource == "outbound":
-                    if len(path) == 6 and path[5] == "decision":
-                        raise ServiceError(403, "service tokens cannot approve transfers")
-                    permission = "outbound_download" if identity.zone == "green" else "outbound_upload"
-                    self.require_service_permission(identity, permission, project_id); return
+                self.require_service_permission(identity, permission); return
+            if path[:2] == ["v1", "objects"] and len(path) >= 3:
+                permission = "inbound_upload"
+                if len(path) == 4 and path[3] == "download": permission = "inbound_download"
+                record = service.store.one("SELECT uploader FROM objects WHERE id=?", (path[2],))
+                if record and record["uploader"] != identity.username:
+                    raise ServiceError(404, "object not found")
+                self.require_service_permission(identity, permission); return
+            if path[:2] == ["v1", "outbound"] and len(path) >= 3:
+                if len(path) == 4 and path[3] == "decision":
+                    raise ServiceError(403, "service tokens cannot approve transfers")
+                permission = "outbound_download" if identity.zone == "green" else "outbound_upload"
+                if len(path) == 4 and path[3] == "download":
+                    record = service.store.one("SELECT uploader FROM outbound_transfers WHERE id=?", (path[2],))
+                    if record and record["uploader"] != identity.username:
+                        raise ServiceError(404, "outbound transfer not found")
+                self.require_service_permission(identity, permission); return
             raise ServiceError(403, "service token cannot access this endpoint")
 
         def read_json(self):
@@ -615,7 +615,7 @@ def make_handler(service: SFSSService, authenticator):
             result = service.process_approval_callback(event, payload_hash)
             transfer = result.pop("transfer")
             self.audit("approval-relay", "outbound.approval.callback", result["status"],
-                       transfer["project_id"], transfer["id"],
+                       transfer["id"],
                        {"event_id":event.get("event_id"), "approval_id":event.get("approval_id")})
             return self.respond(200, {**result, "transfer":public_outbound(transfer)})
 
@@ -633,6 +633,15 @@ def make_handler(service: SFSSService, authenticator):
 
         def dispatch(self, method):
             path = [unquote(piece) for piece in urlparse(self.path).path.split("/") if piece]
+            if (path == ["v1", "integrations", "wecom", "callback"] or
+                    (len(path) >= 3 and path[:3] == ["v1", "admin", "outbound"]) or
+                    path[:2] == ["v1", "outbound"] or
+                    (len(path) == 3 and path[:2] == ["v1", "admin"] and
+                     path[2] in {"outbound-policy", "audit"})):
+                service.require_workflow("outbound")
+            if ((len(path) >= 3 and path[:3] == ["v1", "admin", "objects"]) or
+                    path[:2] == ["v1", "objects"]):
+                service.require_workflow("inbound")
             if path != ["health"]: self.enforce_gateway_boundary(path)
             web_dir = Path(__file__).parent / "web"
             if method == "GET" and (not path or path in (["green"], ["red"], ["admin"])):
@@ -651,7 +660,7 @@ def make_handler(service: SFSSService, authenticator):
                 results = [self.scanner_health(scanner) for scanner in service.scanners]
                 storage = service.storage_status()
                 relay_required = bool(service.store.one(
-                    "SELECT project_id FROM outbound_policies WHERE enabled=1 AND approval_provider='wecom' LIMIT 1"))
+                    "SELECT id FROM outbound_policy WHERE enabled=1 AND approval_provider='wecom' LIMIT 1"))
                 relay_errors = service.settings.approval_relay_errors() if relay_required else []
                 secret_errors = service.settings.runtime_secret_errors()
                 artifact_errors = service.security_artifact_errors()
@@ -667,6 +676,7 @@ def make_handler(service: SFSSService, authenticator):
                          not secret_errors and not artifact_errors and configuration_ok and maintenance_ok)
                 return self.respond(200 if ready else 503, {
                     "status":"ready" if ready else "degraded",
+                    "deployment_mode":service.settings.deployment_mode,
                     "scanners":results,
                     "queue":service.queue.health() if hasattr(service.queue, "health") else {},
                     "storage":storage,
@@ -744,58 +754,53 @@ def make_handler(service: SFSSService, authenticator):
                 return self.respond(204, headers=headers)
 
             if method == "GET" and path == ["v1", "me"]:
-                return self.respond(200, {"username": actor, "global_admin": service.store.is_global_admin(actor)})
+                return self.respond(200, {"username": actor, "global_admin": service.store.is_global_admin(actor),
+                                          "approver": service.store.is_approver(actor),
+                                          "deployment_mode":service.settings.deployment_mode})
 
             if method == "GET" and path == ["v1", "admin", "overview"]:
                 if not service.store.is_global_admin(actor):
                     raise ServiceError(403, "platform administrator required")
+                inbound_enabled = service.workflow_enabled("inbound")
+                outbound_enabled = service.workflow_enabled("outbound")
                 counts = {
                     "users": service.store.one("SELECT COUNT(*) AS value FROM users")["value"],
-                    "projects": service.store.one("SELECT COUNT(*) AS value FROM projects")["value"],
-                    "objects": service.store.one("SELECT (SELECT COUNT(*) FROM objects)+(SELECT COUNT(*) FROM outbound_transfers) AS value")["value"],
-                    "bytes": service.store.one("SELECT (SELECT COALESCE(SUM(size),0) FROM objects)+(SELECT COALESCE(SUM(size),0) FROM outbound_transfers) AS value")["value"],
+                    "objects": service.store.one("SELECT ?*(SELECT COUNT(*) FROM objects)+?*(SELECT COUNT(*) FROM outbound_transfers) AS value", (int(inbound_enabled), int(outbound_enabled)))["value"],
+                    "bytes": service.store.one("SELECT ?*(SELECT COALESCE(SUM(size),0) FROM objects)+?*(SELECT COALESCE(SUM(size),0) FROM outbound_transfers) AS value", (int(inbound_enabled), int(outbound_enabled)))["value"],
                     "active_uploads": service.store.one("SELECT COUNT(*) AS value FROM upload_sessions WHERE state IN ('uploading','completing')")["value"],
                     "staged_bytes": service.store.one("SELECT COALESCE(SUM(size),0) AS value FROM upload_parts p JOIN upload_sessions s ON s.id=p.upload_id WHERE s.state IN ('uploading','completing')")["value"],
                 }
                 storage = service.storage_status()
                 states = {row["state"]: row["count"] for row in service.store.all(
                     "SELECT state,COUNT(*) AS count FROM objects GROUP BY state"
-                )}
+                )} if inbound_enabled else {}
                 outbound_states = {row["state"]: row["count"] for row in service.store.all(
                     "SELECT state,COUNT(*) AS count FROM outbound_transfers GROUP BY state"
-                )}
-                projects = service.store.all("""
-                    SELECT p.id,p.name,p.created_at,
-                           (SELECT COUNT(DISTINCT m.username) FROM memberships m WHERE m.project_id=p.id) AS member_count,
-                           (SELECT COUNT(*) FROM objects o WHERE o.project_id=p.id) AS object_count,
-                           (SELECT COALESCE(SUM(o.size),0) FROM objects o WHERE o.project_id=p.id) AS total_bytes
-                    FROM projects p ORDER BY p.created_at DESC,p.id
-                """)
+                )} if outbound_enabled else {}
                 users = service.store.all("""
-                    SELECT u.username,u.global_admin,u.principal_type,
+                    SELECT u.username,u.global_admin,u.approver,u.principal_type,
                            (u.enabled AND COALESCE(a.enabled,1)) AS enabled,
-                           COUNT(DISTINCT m.project_id) AS project_count,
-                           GROUP_CONCAT(DISTINCT m.role) AS roles
+                           (SELECT COUNT(*) FROM objects o WHERE o.uploader=u.username) +
+                           (SELECT COUNT(*) FROM outbound_transfers t WHERE t.uploader=u.username) AS object_count
                     FROM users u LEFT JOIN local_accounts a ON a.username=u.username
-                    LEFT JOIN memberships m ON m.username=u.username
-                    GROUP BY u.username,u.global_admin,a.enabled ORDER BY u.global_admin DESC,u.username
+                    ORDER BY u.global_admin DESC,u.username
                 """)
                 objects = service.store.all(
-                    "SELECT id,project_id,filename,size,media_type,state,created_at FROM objects ORDER BY created_at DESC,id DESC LIMIT 100"
-                )
+                    "SELECT id,uploader,filename,size,media_type,state,created_at FROM objects ORDER BY created_at DESC,id DESC LIMIT 100"
+                ) if inbound_enabled else []
                 outbound_objects = service.store.all(
-                    "SELECT id,project_id,filename,size,media_type,state,created_at FROM outbound_transfers ORDER BY created_at DESC,id DESC LIMIT 100"
-                )
+                    "SELECT id,uploader,filename,size,media_type,state,created_at FROM outbound_transfers ORDER BY created_at DESC,id DESC LIMIT 100"
+                ) if outbound_enabled else []
                 pending_approvals = service.store.all(
-                    "SELECT t.* FROM outbound_transfers t JOIN outbound_memberships m ON m.project_id=t.project_id "
-                    "WHERE t.state='pending_approval' AND m.username=? AND m.role='approver' "
-                    "ORDER BY t.created_at DESC,t.id DESC LIMIT 100", (actor,)
-                )
+                    "SELECT * FROM outbound_transfers WHERE state='pending_approval' "
+                    "ORDER BY created_at DESC,id DESC LIMIT 100"
+                ) if outbound_enabled else []
                 events = service.store.all("SELECT * FROM audit_events ORDER BY id DESC LIMIT 100")
                 audit_chain = service.store.verify_audit_chain()
                 self.audit(actor, "admin.overview", "success")
-                return self.respond(200, {"counts": counts, "states": states, "outbound_states": outbound_states,
-                                          "projects": projects, "users": users, "objects": objects,
+                return self.respond(200, {"deployment_mode":service.settings.deployment_mode,
+                                          "counts": counts, "states": states, "outbound_states": outbound_states,
+                                          "users": users, "objects": objects,
                                           "outbound_objects": outbound_objects,
                                           "pending_approvals": [public_outbound(row) for row in pending_approvals],
                                           "events": events, "audit_chain": audit_chain,
@@ -812,7 +817,7 @@ def make_handler(service: SFSSService, authenticator):
                     "multipart_chunk_mb": int(service.store.get_config("multipart_chunk_bytes", str(service.settings.multipart_chunk_bytes))) // (1024 * 1024),
                     "upload_session_hours": int(service.store.get_config("upload_session_ttl_seconds", str(service.settings.upload_session_ttl_seconds))) // 3600,
                     "max_active_uploads_per_user": int(service.store.get_config("max_active_uploads_per_user", str(service.settings.max_active_uploads_per_user))),
-                    "max_staged_gb_per_project": int(service.store.get_config("max_staged_bytes_per_project", str(service.settings.max_staged_bytes_per_project))) // (1024 ** 3),
+                    "max_staged_gb_per_user": int(service.store.get_config("max_staged_bytes_per_user", str(service.settings.max_staged_bytes_per_user))) // (1024 ** 3),
                     "min_free_gb": int(service.store.get_config("min_free_bytes", str(service.settings.min_free_bytes))) // (1024 ** 3),
                     "scanners": service.store.get_config("scanners", service.settings.scanners),
                     "clamav_host": service.store.get_config("clamav_host", service.settings.clamav_host),
@@ -885,8 +890,8 @@ def make_handler(service: SFSSService, authenticator):
                     upload_session_hours = int(data.get("upload_session_hours", 24))
                     active_uploads = int(data.get("max_active_uploads_per_user", service.store.get_config(
                         "max_active_uploads_per_user", str(service.settings.max_active_uploads_per_user))))
-                    staged_gb = int(data.get("max_staged_gb_per_project", int(service.store.get_config(
-                        "max_staged_bytes_per_project", str(service.settings.max_staged_bytes_per_project))) // (1024 ** 3)))
+                    staged_gb = int(data.get("max_staged_gb_per_user", int(service.store.get_config(
+                        "max_staged_bytes_per_user", str(service.settings.max_staged_bytes_per_user))) // (1024 ** 3)))
                     min_free_gb = int(data.get("min_free_gb", int(service.store.get_config(
                         "min_free_bytes", str(service.settings.min_free_bytes))) // (1024 ** 3)))
                     clamav_port = int(data.get("clamav_port", 3310))
@@ -903,7 +908,7 @@ def make_handler(service: SFSSService, authenticator):
                 if not 0 <= min_free_gb <= 1048576 or (service.settings.environment == "production" and min_free_gb < 1):
                     raise ServiceError(400, "storage safety reserve is out of range")
                 if staged_gb * 1024 < max_upload_mb:
-                    raise ServiceError(400, "project staging quota must be at least the single-file limit")
+                    raise ServiceError(400, "user staging quota must be at least the single-file limit")
                 if not scanner_names or not scanner_names.issubset({"mock", "clamav", "yara"}):
                     raise ServiceError(400, "scanner list must contain mock, clamav, or yara")
                 if service.settings.environment == "production" and ("mock" in scanner_names or "clamav" not in scanner_names):
@@ -932,7 +937,7 @@ def make_handler(service: SFSSService, authenticator):
                     "multipart_chunk_bytes": str(multipart_chunk_mb * 1024 * 1024),
                     "upload_session_ttl_seconds": str(upload_session_hours * 3600),
                     "max_active_uploads_per_user": str(active_uploads),
-                    "max_staged_bytes_per_project": str(staged_gb * 1024 ** 3),
+                    "max_staged_bytes_per_user": str(staged_gb * 1024 ** 3),
                     "min_free_bytes": str(min_free_gb * 1024 ** 3),
                     "clamav_host": clamav_host, "clamav_port": str(clamav_port), "yara_rules": yara_rules,
                 }
@@ -1041,6 +1046,22 @@ def make_handler(service: SFSSService, authenticator):
                 except ValueError as exc: raise ServiceError(400, str(exc)) from exc
                 return self.respond(200, {"status": "updated"})
 
+            if method == "PUT" and len(path) == 5 and path[:3] == ["v1", "admin", "users"] and path[4] == "approver":
+                if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
+                username = path[3]; data = self.read_json()
+                if not isinstance(data.get("approver"), bool): raise ServiceError(400, "approver must be boolean")
+                account = service.store.one("SELECT principal_type,enabled FROM users WHERE username=?", (username,))
+                if not account: raise ServiceError(404, "user not found")
+                if account["principal_type"] != "human":
+                    raise ServiceError(409, "the platform approver role belongs to a human identity")
+                service.store.execute_audited(
+                    "UPDATE users SET approver=? WHERE username=?",
+                    (int(data["approver"]), username),
+                    error="user disappeared during approver grant",
+                    audit=self.audit_payload(actor, "admin.user.approver", "success",
+                                             details={"username":username, "approver":data["approver"]}))
+                return self.respond(200, {"username":username, "approver":data["approver"]})
+
             if method == "GET" and path == ["v1", "admin", "service-tokens"]:
                 if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
                 rows = service.store.all("SELECT * FROM service_tokens ORDER BY created_at DESC,id DESC LIMIT 500")
@@ -1050,7 +1071,7 @@ def make_handler(service: SFSSService, authenticator):
             if method == "POST" and path == ["v1", "admin", "service-tokens"]:
                 if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
                 data = self.read_json(); username = str(data.get("username", "")).strip()
-                project_id = str(data.get("project_id", "")).strip(); zone = str(data.get("zone", "")).strip()
+                zone = str(data.get("zone", "")).strip()
                 label = str(data.get("label", "")).strip()[:100]
                 permissions = data.get("permissions", [])
                 maximum_token_hours = service.settings.service_token_max_ttl_seconds // 3600
@@ -1063,27 +1084,22 @@ def make_handler(service: SFSSService, authenticator):
                 principal = service.store.one("SELECT principal_type,enabled FROM users WHERE username=?", (username,))
                 if principal["principal_type"] != "service" or not principal["enabled"]:
                     raise ServiceError(409, "token owner must be an enabled service identity")
-                project = service.store.one("SELECT archived FROM projects WHERE id=?", (project_id,))
-                if not project or project["archived"]: raise ServiceError(404, "active project not found")
                 normalized = set(str(value) for value in permissions)
                 zone_permissions = {"green":{"inbound_upload","outbound_download"},
                                     "red":{"inbound_download","outbound_upload"}}
+                deployed_permissions = ({"inbound_upload", "inbound_download"}
+                                        if service.settings.deployment_mode == "inbound" else
+                                        {"outbound_upload", "outbound_download"}
+                                        if service.settings.deployment_mode == "outbound" else
+                                        {"inbound_upload", "inbound_download", "outbound_upload", "outbound_download"})
                 if zone not in zone_permissions or not normalized or not normalized.issubset(zone_permissions[zone]):
                     raise ServiceError(400, "service token permissions do not match its zone")
-                inbound_roles = service.store.roles(project_id, username)
-                outbound_roles = service.outbound_roles(project_id, username)
-                role_allowed = {
-                    "inbound_upload": bool(inbound_roles.intersection({"admin","uploader"})),
-                    "inbound_download": bool(inbound_roles.intersection({"admin","downloader"})),
-                    "outbound_upload": "red_uploader" in outbound_roles,
-                    "outbound_download": "green_downloader" in outbound_roles,
-                }
-                if any(not role_allowed[permission] for permission in normalized):
-                    raise ServiceError(409, "service identity lacks the project role required by its scope")
+                if not normalized.issubset(deployed_permissions):
+                    raise ServiceError(400, "service token scope belongs to a workflow not deployed here")
                 raw, record = ServiceTokens(service.store).issue(
-                    label=label, username=username, project_id=project_id, zone=zone,
+                    label=label, username=username, zone=zone,
                     permissions=normalized, expires_at=int(time.time()) + expires_hours * 3600, created_by=actor,
-                    audit=self.audit_payload(actor, "admin.service_token.create", "success", project_id,
+                    audit=self.audit_payload(actor, "admin.service_token.create", "success",
                                              details={"username":username, "zone":zone,
                                                       "permissions":sorted(normalized),
                                                       "expires_hours":expires_hours}),
@@ -1098,45 +1114,9 @@ def make_handler(service: SFSSService, authenticator):
                 service.store.execute_audited(
                     "UPDATE service_tokens SET revoked=1 WHERE id=?", (path[3],),
                     error="service token disappeared during revocation",
-                    audit=self.audit_payload(actor, "admin.service_token.revoke", "success",
-                                             record["project_id"], details={"token_id":path[3]}))
+                     audit=self.audit_payload(actor, "admin.service_token.revoke", "success",
+                                              details={"token_id":path[3]}))
                 return self.respond(204)
-
-            if method == "PUT" and len(path) == 4 and path[:3] == ["v1", "admin", "projects"]:
-                if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
-                data = self.read_json(); name = str(data.get("name", "")).strip()
-                if not name: raise ServiceError(400, "project name required")
-                if not service.store.one("SELECT id FROM projects WHERE id=?", (path[3],)): raise ServiceError(404, "project not found")
-                service.store.execute_audited(
-                    "UPDATE projects SET name=? WHERE id=?", (name, path[3]),
-                    error="project disappeared during update",
-                    audit=self.audit_payload(actor, "admin.project.update", "success",
-                                             project_id=path[3], details={"name":name}))
-                return self.respond(200, {"status": "updated"})
-
-            if method == "DELETE" and len(path) == 4 and path[:3] == ["v1", "admin", "projects"]:
-                if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
-                if not service.store.one("SELECT id FROM projects WHERE id=?", (path[3],)): raise ServiceError(404, "project not found")
-                service.store.transaction_audited((
-                    ("UPDATE projects SET archived=1 WHERE id=?", (path[3],)),
-                    ("UPDATE service_tokens SET revoked=1 WHERE project_id=?", (path[3],)),
-                    ("UPDATE auth_sessions SET revoked=1 WHERE username IN ("
-                     "SELECT username FROM users WHERE principal_type='service' AND ("
-                     "EXISTS(SELECT 1 FROM memberships m WHERE m.project_id=? AND m.username=users.username) OR "
-                     "EXISTS(SELECT 1 FROM outbound_memberships m WHERE m.project_id=? AND m.username=users.username)))",
-                     (path[3], path[3])),
-                ), audit=self.audit_payload(actor, "admin.project.archive", "success", project_id=path[3]))
-                return self.respond(204)
-
-            if method == "POST" and len(path) == 5 and path[:3] == ["v1", "admin", "projects"] and path[4] == "restore":
-                if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
-                project = service.store.one("SELECT id,archived FROM projects WHERE id=?", (path[3],))
-                if not project: raise ServiceError(404, "project not found")
-                service.store.execute_audited(
-                    "UPDATE projects SET archived=0 WHERE id=?", (path[3],),
-                    error="project disappeared during restore",
-                    audit=self.audit_payload(actor, "admin.project.restore", "success", project_id=path[3]))
-                return self.respond(200, {"status": "restored"})
 
             if method == "POST" and len(path) == 5 and path[:3] == ["v1", "admin", "objects"]:
                 if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
@@ -1145,7 +1125,7 @@ def make_handler(service: SFSSService, authenticator):
                 elif action == "expire": service.expire_object(object_id)
                 else: raise ServiceError(404, "unknown object action")
                 obj = service.get_object(object_id)
-                self.audit(actor, f"admin.object.{action}", "success", project_id=obj["project_id"], object_id=object_id)
+                self.audit(actor, f"admin.object.{action}", "success", object_id=object_id)
                 return self.respond(202 if action == "rescan" else 200, public_object(obj))
 
             if method == "POST" and len(path) == 5 and path[:3] == ["v1", "admin", "outbound"]:
@@ -1155,131 +1135,127 @@ def make_handler(service: SFSSService, authenticator):
                 elif action == "expire": service.expire_outbound(transfer_id)
                 else: raise ServiceError(404, "unknown outbound action")
                 transfer = service.get_outbound(transfer_id)
-                self.audit(actor, f"admin.outbound.{action}", "success", project_id=transfer["project_id"], object_id=transfer_id)
+                self.audit(actor, f"admin.outbound.{action}", "success", object_id=transfer_id)
                 return self.respond(202 if action == "rescan" else 200, public_outbound(transfer))
 
-            if method == "GET" and path == ["v1", "projects"]:
-                if service.store.is_global_admin(actor):
-                    projects = service.store.all("SELECT * FROM projects WHERE archived=0 ORDER BY created_at DESC,id")
+            if method == "GET" and path == ["v1", "objects"]:
+                is_admin = service.store.is_global_admin(actor)
+                if self.zone() == "red":
+                    rows = service.store.all(
+                        "SELECT * FROM objects WHERE state='released' AND (uploader=? OR ?) "
+                        "ORDER BY created_at DESC,id DESC LIMIT 500", (actor, int(is_admin)))
+                elif is_admin:
+                    rows = service.store.all(
+                        "SELECT * FROM objects ORDER BY created_at DESC,id DESC LIMIT 500")
                 else:
-                    projects = service.store.all(
-                        "SELECT p.* FROM projects p WHERE p.archived=0 AND "
-                        "(EXISTS(SELECT 1 FROM memberships m WHERE m.project_id=p.id AND m.username=?) "
-                        "OR EXISTS(SELECT 1 FROM outbound_memberships om WHERE om.project_id=p.id AND om.username=?)) "
-                        "ORDER BY p.created_at DESC,p.id",
-                        (actor, actor),
-                    )
-                for project in projects:
-                    project["roles"] = sorted(service.store.roles(project["id"], actor))
-                    project["outbound_roles"] = sorted(service.outbound_roles(project["id"], actor))
-                if self.zone() == "green":
-                    projects = [project for project in projects if set(project["roles"]).intersection({"admin", "uploader"})
-                                or "green_downloader" in project["outbound_roles"]]
-                elif self.zone() == "red":
-                    projects = [project for project in projects if set(project["roles"]).intersection({"admin", "downloader"})
-                                or set(project["outbound_roles"]).intersection({"red_uploader", "approver"})]
-                if identity.credential_type == "service":
-                    projects = [project for project in projects if project["id"] == identity.project_id]
-                self.audit(actor, "project.list", "success", details={"count":len(projects)})
-                return self.respond(200, {"projects": projects})
+                    rows = service.store.all(
+                        "SELECT * FROM objects WHERE uploader=? ORDER BY created_at DESC,id DESC LIMIT 500",
+                        (actor,))
+                self.audit(actor, "object.list", "success", details={"count":len(rows)})
+                return self.respond(200, {"objects": [public_object(row) for row in rows]})
 
-            if method == "POST" and path == ["v1", "projects"]:
-                data = self.read_json()
-                project_id = str(data.get("id", ""))
-                project = service.create_project(
-                    project_id, str(data.get("name", "")), actor,
-                    audit=self.audit_payload(actor, "project.create", "success", project_id=project_id))
-                return self.respond(201, project)
-
-            if method == "POST" and len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "members":
-                project_id = path[2]
-                data = self.read_json()
-                service.add_member(
-                    project_id, str(data.get("username", "")), str(data.get("role", "")), actor,
-                    audit=self.audit_payload(actor, "membership.add", "success", project_id=project_id,
-                                             details={"username":data.get("username"),
-                                                      "role":data.get("role")}))
-                return self.respond(204)
-
-            if method == "GET" and len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "members":
-                project_id = path[2]; service.require_role(project_id, actor, {"admin"})
-                members = service.store.all("SELECT username,role FROM memberships WHERE project_id=?", (project_id,))
-                members += service.store.all("SELECT username,role FROM outbound_memberships WHERE project_id=?", (project_id,))
-                members.sort(key=lambda row: (row["username"], row["role"]))
-                self.audit(actor, "membership.list", "success", project_id, details={"count":len(members)})
-                return self.respond(200, {"members": members})
-
-            if method == "DELETE" and len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "members":
-                project_id, username, role = path[2], path[4], path[5]
-                service.remove_member(
-                    project_id, username, role, actor,
-                    audit=self.audit_payload(actor, "membership.remove", "success", project_id=project_id,
-                                             details={"username":username, "role":role}))
-                return self.respond(204)
-
-            if method == "GET" and len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "outbound-policy":
-                project_id = path[2]; service.require_role(project_id, actor, {"admin"})
-                policy = service.outbound_policy(project_id); policy["allowed_classifications"] = json.loads(policy["allowed_classifications"])
-                policy["local_approval_allowed"] = service.settings.allow_local_approval
-                self.audit(actor, "outbound.policy.read", "success", project_id)
-                return self.respond(200, policy)
-
-            if method == "PUT" and len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "outbound-policy":
-                project_id = path[2]; policy = service.set_outbound_policy(
-                    project_id, self.read_json(), actor,
-                    audit=self.audit_payload(actor, "outbound.policy.update", "success",
-                                             project_id=project_id))
-                policy["allowed_classifications"] = json.loads(policy["allowed_classifications"])
-                policy["local_approval_allowed"] = service.settings.allow_local_approval
-                return self.respond(200, policy)
-
-            if method == "GET" and len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "network-policy":
-                project_id = path[2]; service.require_role(project_id, actor, {"admin"}); policy = service.network_policy(project_id)
-                policy["inbound_upload_cidrs"] = json.loads(policy["inbound_upload_cidrs"])
-                policy["outbound_upload_cidrs"] = json.loads(policy["outbound_upload_cidrs"])
-                self.audit(actor, "project.network_policy.read", "success", project_id)
-                return self.respond(200, policy)
-
-            if method == "PUT" and len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "network-policy":
-                project_id = path[2]; policy = service.set_network_policy(
-                    project_id, self.read_json(), actor,
-                    audit=self.audit_payload(actor, "project.network_policy.update", "success",
-                                             project_id=project_id))
-                policy["inbound_upload_cidrs"] = json.loads(policy["inbound_upload_cidrs"])
-                policy["outbound_upload_cidrs"] = json.loads(policy["outbound_upload_cidrs"])
-                return self.respond(200, policy)
-
-            if method == "POST" and len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "outbound":
+            if method == "POST" and path == ["v1", "objects"]:
                 if service.settings.environment == "production":
                     raise ServiceError(405, "direct uploads are disabled in production; use multipart upload sessions")
-                project_id = path[2]
+                if self.zone() != "green":
+                    raise ServiceError(403, "uploads are accepted only from the green zone")
+                service.require_source_ip("inbound", self.client_ip())
+                filename = self.headers.get("X-Filename", "")
+                if not service._valid_filename(filename):
+                    raise ServiceError(400, "valid X-Filename header required")
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError as exc:
+                    raise ServiceError(400, "invalid Content-Length") from exc
+                obj = service.upload(
+                    filename, self.rfile, length, actor,
+                    audit=self.audit_payload(actor, "object.upload", "accepted",
+                                             details={"filename":filename, "size":length}))
+                self._body_consumed = True
+                return self.respond(202, public_object(obj), {"Location": f"/v1/objects/{obj['id']}"})
+
+            if method == "GET" and len(path) == 3 and path[:2] == ["v1", "objects"]:
+                obj = service.get_object(path[2])
+                if obj["uploader"] != actor and not service.store.is_global_admin(actor):
+                    raise ServiceError(404, "object not found")
+                if self.zone() == "red" and obj["state"] != "released":
+                    raise ServiceError(404, "object not found")
+                self.audit(actor, "object.read_metadata", "success", path[2])
+                return self.respond(200, public_object(obj))
+
+            if method in {"GET", "HEAD"} and len(path) == 4 and path[:2] == ["v1", "objects"] and path[3] == "download":
+                if self.zone() != "red":
+                    raise ServiceError(403, "downloads are served only to the red zone")
+                obj = service.object_for_download(path[2], actor)
+                source = Path(obj["storage_path"])
+                if not self.respond_download(obj, source, method): return
+                self.audit(actor, "object.download", "success", path[2],
+                           {"sha256": obj["sha256"], "size": obj["size"], "range": self.headers.get("Range")})
+                return
+
+            if method == "GET" and path == ["v1", "outbound"]:
+                is_admin = service.store.is_global_admin(actor)
+                sees_all = is_admin or service.store.is_approver(actor)
+                if self.zone() == "green":
+                    rows = service.store.all(
+                        "SELECT * FROM outbound_transfers WHERE state='released_to_green' AND (uploader=? OR ?) "
+                        "ORDER BY created_at DESC,id DESC LIMIT 500", (actor, int(sees_all)))
+                elif sees_all:
+                    rows = service.store.all(
+                        "SELECT * FROM outbound_transfers ORDER BY created_at DESC,id DESC LIMIT 500")
+                else:
+                    rows = service.store.all(
+                        "SELECT * FROM outbound_transfers WHERE uploader=? ORDER BY created_at DESC,id DESC LIMIT 500",
+                        (actor,))
+                self.audit(actor, "outbound.list", "success", details={"count":len(rows)})
+                return self.respond(200, {"transfers": [public_outbound(row) for row in rows]})
+
+            if method == "POST" and path == ["v1", "outbound"]:
+                if service.settings.environment == "production":
+                    raise ServiceError(405, "direct uploads are disabled in production; use multipart upload sessions")
                 if self.zone() != "red": raise ServiceError(403, "outbound uploads are accepted only from the red zone")
-                service.require_source_ip(project_id, "outbound", self.client_ip())
+                service.require_source_ip("outbound", self.client_ip())
                 filename = self.headers.get("X-Filename", "")
                 if not service._valid_filename(filename): raise ServiceError(400, "valid X-Filename header required")
                 try: length = int(self.headers.get("Content-Length", "0"))
                 except ValueError as exc: raise ServiceError(400, "invalid Content-Length") from exc
                 transfer = service.upload_outbound(
-                    project_id, filename, self.rfile, length, actor,
-                    audit=self.audit_payload(actor, "outbound.upload", "accepted", project_id,
+                    filename, self.rfile, length, actor,
+                    audit=self.audit_payload(actor, "outbound.upload", "accepted",
                                              details={"filename":filename, "size":length}))
                 self._body_consumed = True
                 return self.respond(202, public_outbound(transfer))
 
-            if method == "POST" and len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "uploads":
-                project_id = path[2]; data = self.read_json(); direction = str(data.get("direction", ""))
+            if method == "POST" and len(path) == 4 and path[:2] == ["v1", "outbound"] and path[3] == "decision":
+                data = self.read_json()
+                if self.zone() in {"green", "red"}:
+                    raise ServiceError(403, "approval decisions are available only from the management plane")
+                if not isinstance(data.get("approved"), bool): raise ServiceError(400, "approved must be boolean")
+                transfer = service.decide_outbound(path[2], data["approved"], str(data.get("comment", ""))[:1000], actor)
+                self.audit(actor, "outbound.approval.decision", "approved" if data["approved"] else "rejected", path[2])
+                return self.respond(200, public_outbound(transfer))
+
+            if method in {"GET", "HEAD"} and len(path) == 4 and path[:2] == ["v1", "outbound"] and path[3] == "download":
+                if self.zone() != "green": raise ServiceError(403, "outbound downloads are served only to the green zone")
+                transfer = service.outbound_for_download(path[2], actor); source = Path(transfer["storage_path"])
+                if not self.respond_download(transfer, source, method): return
+                self.audit(actor, "outbound.download", "success", path[2],
+                           {"sha256":transfer["sha256"],"size":transfer["size"],"range":self.headers.get("Range")})
+                return
+
+            if method == "POST" and path == ["v1", "uploads"]:
+                data = self.read_json(); direction = str(data.get("direction", ""))
                 required_zone = "green" if direction == "inbound" else "red" if direction == "outbound" else ""
                 if not required_zone or self.zone() != required_zone:
                     raise ServiceError(403, "upload session is not allowed from this zone")
-                self.require_service_permission(identity, "inbound_upload" if direction == "inbound" else "outbound_upload",
-                                                project_id)
-                service.require_source_ip(project_id, direction, self.client_ip())
+                self.require_service_permission(identity, "inbound_upload" if direction == "inbound" else "outbound_upload")
+                service.require_source_ip(direction, self.client_ip())
                 try: total_size = int(data.get("total_size", 0))
                 except (TypeError, ValueError) as exc: raise ServiceError(400, "invalid total_size") from exc
-                session = service.create_upload_session(project_id, direction, str(data.get("filename", "")),
+                session = service.create_upload_session(direction, str(data.get("filename", "")),
                                                         total_size, actor, data.get("expected_sha256"),
                                                         audit=self.audit_payload(
-                                                            actor, "upload.session.create", "success", project_id,
+                                                            actor, "upload.session.create", "success",
                                                             details={"direction":direction,
                                                                      "filename":str(data.get("filename", "")),
                                                                      "size":total_size}))
@@ -1290,7 +1266,7 @@ def make_handler(service: SFSSService, authenticator):
                 expected_zone = "green" if session["direction"] == "inbound" else "red"
                 if self.zone() in {"green", "red"} and self.zone() != expected_zone:
                     raise ServiceError(403, "upload session is not visible from this zone")
-                self.audit(actor, "upload.session.read", "success", session["project_id"], path[2],
+                self.audit(actor, "upload.session.read", "success", path[2],
                            {"direction":session["direction"], "state":session["state"]})
                 return self.respond(200, public_upload(session))
 
@@ -1300,7 +1276,7 @@ def make_handler(service: SFSSService, authenticator):
                 if self.zone() in {"green", "red"} and self.zone() != expected_zone:
                     raise ServiceError(403, "upload cancellation is not allowed from this zone")
                 service.cancel_upload_session(path[2], actor)
-                self.audit(actor, "upload.session.cancel", "success", session["project_id"], path[2],
+                self.audit(actor, "upload.session.cancel", "success", path[2],
                            {"direction": session["direction"]})
                 return self.respond(204)
 
@@ -1308,14 +1284,14 @@ def make_handler(service: SFSSService, authenticator):
                 session = service.get_upload_session(path[2], actor)
                 expected_zone = "green" if session["direction"] == "inbound" else "red"
                 if self.zone() != expected_zone: raise ServiceError(403, "upload part is not allowed from this zone")
-                service.require_source_ip(session["project_id"], session["direction"], self.client_ip())
+                service.require_source_ip(session["direction"], self.client_ip())
                 try: part_number = int(path[4]); length = int(self.headers.get("Content-Length", "0"))
                 except ValueError as exc: raise ServiceError(400, "invalid part number or Content-Length") from exc
                 part = service.put_upload_part(path[2], part_number, self.rfile, length,
                                                self.headers.get("X-Part-SHA256", ""), actor,
                                                audit=self.audit_payload(
                                                    actor, "upload.part.complete", "success",
-                                                   session["project_id"], path[2],
+                                                   path[2],
                                                    {"part_number":part_number, "size":length}))
                 self._body_consumed = True
                 return self.respond(200, part)
@@ -1324,123 +1300,49 @@ def make_handler(service: SFSSService, authenticator):
                 session = service.get_upload_session(path[2], actor)
                 expected_zone = "green" if session["direction"] == "inbound" else "red"
                 if self.zone() != expected_zone: raise ServiceError(403, "upload completion is not allowed from this zone")
-                service.require_source_ip(session["project_id"], session["direction"], self.client_ip())
+                service.require_source_ip(session["direction"], self.client_ip())
                 record = service.complete_upload_session(path[2], actor)
-                self.audit(actor, "upload.session.complete", "success", session["project_id"], record["id"],
+                self.audit(actor, "upload.session.complete", "success", record["id"],
                            {"upload_id": path[2], "direction": session["direction"], "sha256": record["sha256"]})
                 return self.respond(202, public_object(record) if session["direction"] == "inbound" else public_outbound(record))
 
-            if method == "GET" and len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "outbound":
-                project_id = path[2]
-                project = service.store.one("SELECT archived FROM projects WHERE id=?", (project_id,))
-                if not project or project["archived"]: raise ServiceError(404, "active project not found")
-                project_roles = service.store.roles(project_id, actor); outbound_roles = service.outbound_roles(project_id, actor)
-                if self.zone() == "green":
-                    if "green_downloader" not in outbound_roles: raise ServiceError(403, "green download permission denied")
-                    rows = service.store.all("SELECT * FROM outbound_transfers WHERE project_id=? AND state='released_to_green' ORDER BY created_at DESC,id DESC LIMIT 500", (project_id,))
-                elif self.zone() == "red":
-                    if "admin" not in project_roles and not outbound_roles.intersection({"red_uploader", "approver"}):
-                        raise ServiceError(403, "red outbound permission denied")
-                    if "admin" in project_roles or "approver" in outbound_roles:
-                        rows = service.store.all("SELECT * FROM outbound_transfers WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT 500", (project_id,))
-                    else:
-                        rows = service.store.all("SELECT * FROM outbound_transfers WHERE project_id=? AND uploader=? ORDER BY created_at DESC,id DESC LIMIT 500", (project_id, actor))
-                else:
-                    if "admin" not in project_roles and not outbound_roles: raise ServiceError(403, "outbound project permission denied")
-                    rows = service.store.all("SELECT * FROM outbound_transfers WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT 500", (project_id,))
-                self.audit(actor, "outbound.list", "success", project_id, details={"count":len(rows)})
-                return self.respond(200, {"transfers": [public_outbound(row) for row in rows]})
+            if method == "GET" and path == ["v1", "admin", "outbound-policy"]:
+                if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
+                policy = service.outbound_policy(); policy["allowed_classifications"] = json.loads(policy["allowed_classifications"])
+                policy["local_approval_allowed"] = service.settings.allow_local_approval
+                self.audit(actor, "outbound.policy.read", "success")
+                return self.respond(200, policy)
 
-            if method == "POST" and len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "outbound" and path[5] == "decision":
-                project_id, transfer_id = path[2], path[4]; data = self.read_json()
-                if self.zone() in {"green", "red"}:
-                    raise ServiceError(403, "approval decisions are available only from the management plane")
-                if not isinstance(data.get("approved"), bool): raise ServiceError(400, "approved must be boolean")
-                transfer = service.decide_outbound(project_id, transfer_id, data["approved"], str(data.get("comment", ""))[:1000], actor)
-                self.audit(actor, "outbound.approval.decision", "approved" if data["approved"] else "rejected", project_id, transfer_id)
-                return self.respond(200, public_outbound(transfer))
+            if method == "PUT" and path == ["v1", "admin", "outbound-policy"]:
+                if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
+                policy = service.set_outbound_policy(
+                    self.read_json(), actor,
+                    audit=self.audit_payload(actor, "outbound.policy.update", "success"))
+                policy["allowed_classifications"] = json.loads(policy["allowed_classifications"])
+                policy["local_approval_allowed"] = service.settings.allow_local_approval
+                return self.respond(200, policy)
 
-            if method in {"GET", "HEAD"} and len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "outbound" and path[5] == "download":
-                project_id, transfer_id = path[2], path[4]
-                if self.zone() != "green": raise ServiceError(403, "outbound downloads are served only to the green zone")
-                transfer = service.outbound_for_download(project_id, transfer_id, actor); source = Path(transfer["storage_path"])
-                if not self.respond_download(transfer, source, method): return
-                self.audit(actor, "outbound.download", "success", project_id, transfer_id,
-                           {"sha256":transfer["sha256"],"size":transfer["size"],"range":self.headers.get("Range")})
-                return
+            if method == "GET" and path == ["v1", "admin", "network-policy"]:
+                if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
+                policy = service.network_policy()
+                policy["inbound_upload_cidrs"] = json.loads(policy["inbound_upload_cidrs"])
+                policy["outbound_upload_cidrs"] = json.loads(policy["outbound_upload_cidrs"])
+                self.audit(actor, "platform.network_policy.read", "success")
+                return self.respond(200, policy)
 
-            if method == "POST" and len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "objects":
-                if service.settings.environment == "production":
-                    raise ServiceError(405, "direct uploads are disabled in production; use multipart upload sessions")
-                project_id = path[2]
-                if self.zone() != "green":
-                    raise ServiceError(403, "uploads are accepted only from the green zone")
-                service.require_source_ip(project_id, "inbound", self.client_ip())
-                filename = self.headers.get("X-Filename", "")
-                if not service._valid_filename(filename):
-                    raise ServiceError(400, "valid X-Filename header required")
-                try:
-                    length = int(self.headers.get("Content-Length", "0"))
-                except ValueError as exc:
-                    raise ServiceError(400, "invalid Content-Length") from exc
-                obj = service.upload(
-                    project_id, filename, self.rfile, length, actor,
-                    audit=self.audit_payload(actor, "object.upload", "accepted", project_id,
-                                             details={"filename":filename, "size":length}))
-                self._body_consumed = True
-                return self.respond(202, public_object(obj), {"Location": f"/v1/projects/{project_id}/objects/{obj['id']}"})
+            if method == "PUT" and path == ["v1", "admin", "network-policy"]:
+                if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
+                policy = service.set_network_policy(
+                    self.read_json(), actor,
+                    audit=self.audit_payload(actor, "platform.network_policy.update", "success"))
+                policy["inbound_upload_cidrs"] = json.loads(policy["inbound_upload_cidrs"])
+                policy["outbound_upload_cidrs"] = json.loads(policy["outbound_upload_cidrs"])
+                return self.respond(200, policy)
 
-            if method == "GET" and len(path) == 5 and path[:2] == ["v1", "projects"] and path[3] == "objects":
-                project_id, object_id = path[2], path[4]
-                obj = service.get_object(object_id)
-                if obj["project_id"] != project_id:
-                    raise ServiceError(404, "object not found in project")
-                roles = service.store.roles(project_id, actor)
-                if self.zone() == "red":
-                    service.require_role(project_id, actor, {"admin", "downloader"})
-                    if obj["state"] != "released": raise ServiceError(404, "object not found in project")
-                elif self.zone() == "green":
-                    service.require_role(project_id, actor, {"admin", "uploader"})
-                    if "admin" not in roles and obj["uploader"] != actor:
-                        raise ServiceError(404, "object not found in project")
-                else:
-                    service.require_role(project_id, actor, {"admin", "uploader", "downloader", "auditor"})
-                self.audit(actor, "object.read_metadata", "success", project_id, object_id)
-                return self.respond(200, public_object(obj))
-
-            if method == "GET" and len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "objects":
-                project_id = path[2]
-                if self.zone() == "red":
-                    service.require_role(project_id, actor, {"admin", "downloader"})
-                    rows = service.store.all("SELECT * FROM objects WHERE project_id=? AND state='released' ORDER BY created_at DESC,id DESC LIMIT 500", (project_id,))
-                elif self.zone() == "green":
-                    service.require_role(project_id, actor, {"admin", "uploader"})
-                    if "admin" in service.store.roles(project_id, actor):
-                        rows = service.store.all("SELECT * FROM objects WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT 500", (project_id,))
-                    else:
-                        rows = service.store.all("SELECT * FROM objects WHERE project_id=? AND uploader=? ORDER BY created_at DESC,id DESC LIMIT 500", (project_id, actor))
-                else:
-                    service.require_role(project_id, actor, {"admin", "uploader", "downloader", "auditor"})
-                    rows = service.store.all("SELECT * FROM objects WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT 500", (project_id,))
-                self.audit(actor, "object.list", "success", project_id, details={"count":len(rows)})
-                return self.respond(200, {"objects": [public_object(row) for row in rows]})
-
-            if method in {"GET", "HEAD"} and len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "objects" and path[5] == "download":
-                project_id, object_id = path[2], path[4]
-                if self.zone() != "red":
-                    raise ServiceError(403, "downloads are served only to the red zone")
-                obj = service.object_for_download(project_id, object_id, actor)
-                source = Path(obj["storage_path"])
-                if not self.respond_download(obj, source, method): return
-                self.audit(actor, "object.download", "success", project_id, object_id,
-                           {"sha256": obj["sha256"], "size": obj["size"], "range": self.headers.get("Range")})
-                return
-
-            if method == "GET" and len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "audit":
-                project_id = path[2]
-                service.require_role(project_id, actor, {"admin", "auditor"})
-                rows = service.store.all("SELECT * FROM audit_events WHERE project_id=? ORDER BY id DESC LIMIT 500", (project_id,))
-                self.audit(actor, "audit.list", "success", project_id)
+            if method == "GET" and path == ["v1", "admin", "audit"]:
+                if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
+                rows = service.store.all("SELECT * FROM audit_events ORDER BY id DESC LIMIT 500")
+                self.audit(actor, "audit.list", "success", details={"count":len(rows)})
                 return self.respond(200, {"events": rows})
 
             raise ServiceError(404, "route not found")
@@ -1465,9 +1367,8 @@ def make_handler(service: SFSSService, authenticator):
                 try: actor = authenticator.authenticate(self.authentication_headers()).username
                 except Exception: pass
                 pieces = [unquote(piece) for piece in urlparse(self.path).path.split("/") if piece]
-                project_id = pieces[2] if len(pieces) >= 3 and pieces[:2] == ["v1", "projects"] else None
-                object_id = pieces[4] if len(pieces) >= 5 and pieces[3] in {"objects", "outbound"} else None
-                self.audit(actor, "request.denied", "denied", project_id=project_id, object_id=object_id,
+                object_id = pieces[2] if len(pieces) >= 3 and pieces[:2] in (["v1", "objects"], ["v1", "outbound"]) else None
+                self.audit(actor, "request.denied", "denied", object_id=object_id,
                            details={"method": method, "status": exc.status, "reason": str(exc)})
                 self.respond(exc.status, {"error": str(exc)})
             except (TimeoutError, socket.timeout):
@@ -1505,6 +1406,7 @@ def create_runtime(settings: Settings):
     settings.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     settings.data_dir.chmod(0o700)
     store = Store(settings.data_dir / "sfss.db")
+    _validate_deployment_database_scope(settings, store)
     fingerprint = settings.configuration_fingerprint(
         store.all("SELECT key,value FROM system_config ORDER BY key"))
     if settings.environment == "production" and fingerprint != settings.expected_config_sha256:
@@ -1526,7 +1428,7 @@ def create_runtime(settings: Settings):
             "UPDATE auth_sessions SET revoked=1 WHERE revoked=0 AND auth_backend!=?",
             (settings.auth_backend,)),), audit={
                 "request_id":"startup-auth-backend-revoke", "actor":"system",
-                "action":"session.backend_mismatch_revoked", "project_id":None, "object_id":None,
+                "action":"session.backend_mismatch_revoked", "object_id":None,
                 "outcome":"success", "source_zone":"startup", "remote_addr":"local",
                 "details":{"revoked":revoked, "required_backend":settings.auth_backend}})
     if settings.environment == "production":
@@ -1538,7 +1440,7 @@ def create_runtime(settings: Settings):
                 "UPDATE auth_sessions SET revoked=1 WHERE revoked=0 "
                 "AND zone NOT IN ('green','red','admin')", ()),), audit={
                     "request_id":"startup-session-zone-revoke", "actor":"system",
-                    "action":"session.unbound_revoked", "project_id":None, "object_id":None,
+                    "action":"session.unbound_revoked", "object_id":None,
                     "outcome":"success", "source_zone":"startup", "remote_addr":"local",
                     "details":{"revoked":revoked_zones}})
         unsafe_token = store.one(
@@ -1549,10 +1451,10 @@ def create_runtime(settings: Settings):
         if unsafe_token:
             raise ValueError("unsafe production identity database: active service token lifetime exceeds policy")
     if settings.environment == "production" and store.one(
-        "SELECT project_id FROM outbound_policies WHERE enabled=1 AND approval_provider='local' LIMIT 1"
+        "SELECT id FROM outbound_policy WHERE enabled=1 AND approval_provider='local' LIMIT 1"
     ):
         raise ValueError("unsafe persisted production policy: enabled local outbound approval")
-    if store.one("SELECT project_id FROM outbound_policies WHERE enabled=1 AND approval_provider='wecom' LIMIT 1"):
+    if store.one("SELECT id FROM outbound_policy WHERE enabled=1 AND approval_provider='wecom' LIMIT 1"):
         relay_errors = settings.approval_relay_errors()
         if relay_errors:
             raise ValueError("unsafe persisted approval relay configuration: " + "; ".join(relay_errors))
@@ -1588,9 +1490,36 @@ def create_runtime(settings: Settings):
         if unhealthy:
             raise ValueError("production scanner dependency is unavailable: " +
                              ", ".join(f"{result.scanner}={result.detail}" for result in unhealthy))
-    queue = SQLiteJobQueue(store, settings.job_workers, settings.job_lease_seconds, settings.job_max_attempts)
+    allowed_kinds = ({"scan_object"} if settings.deployment_mode == "inbound" else
+                     {"scan_outbound"} if settings.deployment_mode == "outbound" else
+                     {"scan_object", "scan_outbound"})
+    queue = SQLiteJobQueue(store, settings.job_workers, settings.job_lease_seconds,
+                           settings.job_max_attempts, allowed_kinds=allowed_kinds)
     service = SFSSService(settings, store, scanners, queue)
     return service
+
+
+def _validate_deployment_database_scope(settings: Settings, store: Store):
+    if settings.deployment_mode == "combined":
+        return
+    if settings.deployment_mode == "inbound":
+        checks = (
+            ("SELECT 1 FROM outbound_transfers LIMIT 1", "outbound transfer records"),
+            ("SELECT 1 FROM outbound_policy LIMIT 1", "outbound policy"),
+            ("SELECT 1 FROM upload_sessions WHERE direction='outbound' LIMIT 1", "outbound upload sessions"),
+            ("SELECT 1 FROM scan_jobs WHERE kind='scan_outbound' LIMIT 1", "outbound scan jobs"),
+            ("SELECT 1 FROM service_tokens WHERE permissions LIKE '%outbound_%' LIMIT 1", "outbound service tokens"),
+        )
+    else:
+        checks = (
+            ("SELECT 1 FROM objects LIMIT 1", "inbound object records"),
+            ("SELECT 1 FROM upload_sessions WHERE direction='inbound' LIMIT 1", "inbound upload sessions"),
+            ("SELECT 1 FROM scan_jobs WHERE kind='scan_object' LIMIT 1", "inbound scan jobs"),
+            ("SELECT 1 FROM service_tokens WHERE permissions LIKE '%inbound_%' LIMIT 1", "inbound service tokens"),
+        )
+    for query, label in checks:
+        if store.one(query):
+            raise ValueError(f"deployment database scope violation: {label} exist in {settings.deployment_mode} system")
 
 
 def _validate_production_data_tree(root: Path):
@@ -1629,8 +1558,10 @@ def validate_listener(settings: Settings, host, unix_socket):
     if unix_socket:
         path = Path(unix_socket)
         if not path.is_absolute(): raise ValueError("SFSS Unix socket path must be absolute")
-        if settings.environment == "production" and path.parent != Path("/run/sfss"):
-            raise ValueError("production SFSS Unix socket must be directly under /run/sfss")
+        expected_parent = (Path("/run/sfss") if settings.deployment_mode == "combined" else
+                           Path(f"/run/sfss-{settings.deployment_mode}"))
+        if settings.environment == "production" and path.parent != expected_parent:
+            raise ValueError(f"production SFSS Unix socket must be directly under {expected_parent}")
         return
     selected_host = host or "127.0.0.1"
     if settings.environment == "production":
@@ -1665,8 +1596,10 @@ def main():
     if permission_stats["invalid"]:
         runtime_lock.close()
         raise SystemExit("storage integrity validation failed during startup")
-    service.queue.start({"scan_object": service.scan_object, "scan_outbound": service.scan_outbound},
-                        service.fail_scan_job)
+    handlers = ({"scan_object":service.scan_object} if settings.deployment_mode == "inbound" else
+                {"scan_outbound":service.scan_outbound} if settings.deployment_mode == "outbound" else
+                {"scan_object":service.scan_object, "scan_outbound":service.scan_outbound})
+    service.queue.start(handlers, service.fail_scan_job)
     service.recover_interrupted_jobs()
     try: service.run_maintenance()
     except Exception as exc: service.last_maintenance_error = type(exc).__name__

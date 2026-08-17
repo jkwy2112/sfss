@@ -35,11 +35,14 @@ class SQLiteJobQueue(JobQueue):
     ALLOWED_KINDS = {"scan_object", "scan_outbound"}
 
     def __init__(self, store: Store, workers: int = 2, lease_seconds: int = 900,
-                 max_attempts: int = 3):
+                 max_attempts: int = 3, allowed_kinds=None):
         self.store = store
         self.workers = max(1, min(workers, 32))
         self.lease_seconds = max(30, lease_seconds)
         self.max_attempts = max(1, max_attempts)
+        self.allowed_kinds = set(allowed_kinds or self.ALLOWED_KINDS)
+        if not self.allowed_kinds or not self.allowed_kinds.issubset(self.ALLOWED_KINDS):
+            raise ValueError("durable queue has invalid allowed job kinds")
         self.handlers: Dict[str, Callable[[str], None]] = {}
         self.dead_letter: Optional[Callable[[str, str, str], None]] = None
         self._condition = threading.Condition()
@@ -50,8 +53,8 @@ class SQLiteJobQueue(JobQueue):
     def start(self, handlers: Dict[str, Callable[[str], None]],
               dead_letter: Optional[Callable[[str, str, str], None]] = None):
         if self._started: return
-        if set(handlers) != self.ALLOWED_KINDS:
-            raise ValueError("durable queue requires both scan handlers")
+        if set(handlers) != self.allowed_kinds:
+            raise ValueError("durable queue handlers do not match this deployment")
         self.handlers = dict(handlers); self.dead_letter = dead_letter; self._started = True
         now = int(time.time())
         # SQLite mode is deliberately single-node. Any running lease belongs to
@@ -66,7 +69,7 @@ class SQLiteJobQueue(JobQueue):
 
     def submit(self, job: Callable, *args) -> None:
         kind = getattr(job, "__name__", "")
-        if kind not in self.ALLOWED_KINDS or len(args) != 1 or not isinstance(args[0], str):
+        if kind not in self.allowed_kinds or len(args) != 1 or not isinstance(args[0], str):
             raise ValueError("unsupported durable scan job")
         now = int(time.time())
         self.store.execute(

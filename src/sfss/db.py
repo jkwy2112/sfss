@@ -12,8 +12,9 @@ class MutationConflictError(RuntimeError):
 
 
 class Store:
-    # Version 2 adds an explicit entrance binding to every human session.
-    SCHEMA_VERSION = 2
+    # Version 3 replaces project scoping with personal user spaces,
+    # platform-level approver roles, and global transfer policies.
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: Path, read_only: bool = False):
         self.path = path.resolve() if read_only else path
@@ -64,6 +65,11 @@ class Store:
                 if row and row[0] > self.SCHEMA_VERSION:
                     raise RuntimeError(
                         f"database schema version {row[0]} is newer than supported version {self.SCHEMA_VERSION}")
+                if row and row[0] < self.SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"database schema version {row[0]} predates the personal-space model; "
+                        "project-scoped databases cannot be migrated automatically. Back up the "
+                        "old data directory and initialize a fresh one.")
             audit_chain_is_new = "audit_chain" not in existing_tables
             db.executescript("""
             CREATE TABLE IF NOT EXISTS schema_metadata (
@@ -73,21 +79,12 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS users (
               username TEXT PRIMARY KEY, global_admin INTEGER NOT NULL DEFAULT 0,
+              approver INTEGER NOT NULL DEFAULT 0,
               principal_type TEXT NOT NULL DEFAULT 'human' CHECK(principal_type IN ('human','service')),
               enabled INTEGER NOT NULL DEFAULT 1
             );
-            CREATE TABLE IF NOT EXISTS projects (
-              id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS memberships (
-              project_id TEXT NOT NULL REFERENCES projects(id),
-              username TEXT NOT NULL REFERENCES users(username),
-              role TEXT NOT NULL CHECK(role IN ('admin','uploader','downloader','auditor')),
-              PRIMARY KEY(project_id, username, role)
-            );
             CREATE TABLE IF NOT EXISTS objects (
               id TEXT PRIMARY KEY,
-              project_id TEXT NOT NULL REFERENCES projects(id),
               uploader TEXT NOT NULL REFERENCES users(username),
               filename TEXT NOT NULL,
               size INTEGER NOT NULL,
@@ -110,7 +107,6 @@ class Store:
               request_id TEXT NOT NULL,
               actor TEXT NOT NULL,
               action TEXT NOT NULL,
-              project_id TEXT,
               object_id TEXT,
               outcome TEXT NOT NULL,
               source_zone TEXT NOT NULL,
@@ -151,7 +147,6 @@ class Store:
               token_hash TEXT NOT NULL UNIQUE,
               label TEXT NOT NULL,
               username TEXT NOT NULL REFERENCES users(username),
-              project_id TEXT NOT NULL REFERENCES projects(id),
               zone TEXT NOT NULL CHECK(zone IN ('green','red')),
               permissions TEXT NOT NULL,
               created_at INTEGER NOT NULL,
@@ -176,14 +171,8 @@ class Store:
               received_at INTEGER NOT NULL,
               outcome TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS outbound_memberships (
-              project_id TEXT NOT NULL REFERENCES projects(id),
-              username TEXT NOT NULL REFERENCES users(username),
-              role TEXT NOT NULL CHECK(role IN ('red_uploader','approver','green_downloader')),
-              PRIMARY KEY(project_id,username,role)
-            );
-            CREATE TABLE IF NOT EXISTS outbound_policies (
-              project_id TEXT PRIMARY KEY REFERENCES projects(id),
+            CREATE TABLE IF NOT EXISTS outbound_policy (
+              id INTEGER PRIMARY KEY CHECK(id=1),
               enabled INTEGER NOT NULL DEFAULT 0,
               allowed_classifications TEXT NOT NULL DEFAULT '["GDS","FPGA_BITFILE","GENERAL"]',
               approval_provider TEXT NOT NULL DEFAULT 'local',
@@ -192,8 +181,8 @@ class Store:
               updated_at INTEGER NOT NULL,
               updated_by TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS project_network_policies (
-              project_id TEXT PRIMARY KEY REFERENCES projects(id),
+            CREATE TABLE IF NOT EXISTS network_policy (
+              id INTEGER PRIMARY KEY CHECK(id=1),
               inbound_upload_cidrs TEXT NOT NULL DEFAULT '["127.0.0.1/32","::1/128"]',
               outbound_upload_cidrs TEXT NOT NULL DEFAULT '["127.0.0.1/32","::1/128"]',
               updated_at INTEGER NOT NULL,
@@ -201,7 +190,6 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS outbound_transfers (
               id TEXT PRIMARY KEY,
-              project_id TEXT NOT NULL REFERENCES projects(id),
               uploader TEXT NOT NULL REFERENCES users(username),
               filename TEXT NOT NULL,
               size INTEGER NOT NULL,
@@ -227,7 +215,6 @@ class Store:
             );
             CREATE TABLE IF NOT EXISTS upload_sessions (
               id TEXT PRIMARY KEY,
-              project_id TEXT NOT NULL REFERENCES projects(id),
               actor TEXT NOT NULL REFERENCES users(username),
               direction TEXT NOT NULL CHECK(direction IN ('inbound','outbound')),
               filename TEXT NOT NULL,
@@ -276,14 +263,13 @@ class Store:
             CREATE TRIGGER IF NOT EXISTS audit_chain_no_delete BEFORE DELETE ON audit_chain
             BEGIN SELECT RAISE(ABORT, 'audit chain is append-only'); END;
             """)
-            project_columns = {row[1] for row in db.execute("PRAGMA table_info(projects)")}
-            if "archived" not in project_columns:
-                db.execute("ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
             user_columns = {row[1] for row in db.execute("PRAGMA table_info(users)")}
             if "principal_type" not in user_columns:
                 db.execute("ALTER TABLE users ADD COLUMN principal_type TEXT NOT NULL DEFAULT 'human'")
             if "enabled" not in user_columns:
                 db.execute("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+            if "approver" not in user_columns:
+                db.execute("ALTER TABLE users ADD COLUMN approver INTEGER NOT NULL DEFAULT 0")
             session_columns = {row[1] for row in db.execute("PRAGMA table_info(auth_sessions)")}
             if "auth_backend" not in session_columns:
                 db.execute("ALTER TABLE auth_sessions ADD COLUMN auth_backend TEXT NOT NULL DEFAULT 'legacy'")
@@ -321,7 +307,7 @@ class Store:
 
     @staticmethod
     def _audit_digest(event: Dict[str, Any], previous: str) -> str:
-        fields = ("id", "timestamp", "request_id", "actor", "action", "project_id", "object_id",
+        fields = ("id", "timestamp", "request_id", "actor", "action", "object_id",
                   "outcome", "source_zone", "remote_addr", "details")
         canonical = json.dumps([event.get(key) for key in fields], ensure_ascii=False,
                                separators=(",", ":"))
@@ -406,27 +392,26 @@ class Store:
         row = self.one("SELECT global_admin,enabled,principal_type FROM users WHERE username=?", (username,))
         return bool(row and row["global_admin"] and row["enabled"] and row["principal_type"] == "human")
 
-    def roles(self, project_id: str, username: str) -> set:
-        return {row["role"] for row in self.all(
-            "SELECT role FROM memberships WHERE project_id=? AND username=?", (project_id, username)
-        )}
+    def is_approver(self, username: str) -> bool:
+        row = self.one("SELECT approver,enabled,principal_type FROM users WHERE username=?", (username,))
+        return bool(row and row["approver"] and row["enabled"] and row["principal_type"] == "human")
 
-    def audit(self, *, request_id: str, actor: str, action: str, project_id: Optional[str],
+    def audit(self, *, request_id: str, actor: str, action: str,
               object_id: Optional[str], outcome: str, source_zone: str, remote_addr: str,
               details: Dict[str, Any]):
         with self._lock, self.connect() as db:
             self._append_audit(db, request_id=request_id, actor=actor, action=action,
-                               project_id=project_id, object_id=object_id, outcome=outcome,
+                               object_id=object_id, outcome=outcome,
                                source_zone=source_zone, remote_addr=remote_addr, details=details)
 
     def _append_audit(self, db, *, request_id: str, actor: str, action: str,
-                      project_id: Optional[str], object_id: Optional[str], outcome: str,
+                      object_id: Optional[str], outcome: str,
                       source_zone: str, remote_addr: str, details: Dict[str, Any]):
-        values = (int(time.time()), request_id, actor, action, project_id, object_id, outcome,
+        values = (int(time.time()), request_id, actor, action, object_id, outcome,
                   source_zone, remote_addr, json.dumps(details, ensure_ascii=False, sort_keys=True))
         cursor = db.execute(
-            "INSERT INTO audit_events(timestamp,request_id,actor,action,project_id,object_id,outcome,source_zone,remote_addr,details) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)", values,
+            "INSERT INTO audit_events(timestamp,request_id,actor,action,object_id,outcome,source_zone,remote_addr,details) "
+            "VALUES(?,?,?,?,?,?,?,?,?)", values,
         )
         event_id = cursor.lastrowid
         previous_row = db.execute("SELECT event_hash FROM audit_chain ORDER BY event_id DESC LIMIT 1").fetchone()

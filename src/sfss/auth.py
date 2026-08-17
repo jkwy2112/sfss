@@ -47,7 +47,6 @@ class Identity:
     username: str
     credential_type: str = "user"
     token_id: Optional[str] = None
-    project_id: Optional[str] = None
     zone: Optional[str] = None
     permissions: Tuple[str, ...] = ()
 
@@ -61,7 +60,7 @@ class ServiceTokens:
     def token_hash(token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    def issue(self, *, label: str, username: str, project_id: str, zone: str,
+    def issue(self, *, label: str, username: str, zone: str,
               permissions, expires_at: int, created_by: str, audit=None):
         normalized = tuple(sorted(set(permissions)))
         if zone not in {"green", "red"} or not normalized or not set(normalized).issubset(self.ALLOWED_PERMISSIONS):
@@ -71,27 +70,13 @@ class ServiceTokens:
         if not principal or principal["principal_type"] != "service" or not principal["enabled"]:
             raise ValueError("token owner must be an enabled service identity")
         token_id = str(uuid.uuid4()); raw = secrets.token_urlsafe(32); now = int(time.time())
-        role_checks = {
-            "inbound_upload": ("memberships", ("admin", "uploader")),
-            "inbound_download": ("memberships", ("admin", "downloader")),
-            "outbound_upload": ("outbound_memberships", ("red_uploader",)),
-            "outbound_download": ("outbound_memberships", ("green_downloader",)),
-        }
-        predicates = []
-        for permission in normalized:
-            table, roles = role_checks[permission]
-            placeholders = ",".join("?" for _ in roles)
-            predicates.append(
-                f"EXISTS(SELECT 1 FROM {table} m WHERE m.project_id=p.id "
-                f"AND m.username=u.username AND m.role IN ({placeholders}))")
-        scope_sql = " AND ".join(predicates)
         statement = (
-            "INSERT INTO service_tokens(id,token_hash,label,username,project_id,zone,permissions,created_at,expires_at,created_by) "
-            "SELECT ?,?,?,?,?,?,?,?,?,? FROM users u JOIN projects p ON p.id=? "
-            "WHERE u.username=? AND u.principal_type='service' AND u.enabled=1 AND p.archived=0 AND " + scope_sql,
-            (token_id, self.token_hash(raw), label, username, project_id, zone,
+            "INSERT INTO service_tokens(id,token_hash,label,username,zone,permissions,created_at,expires_at,created_by) "
+            "SELECT ?,?,?,?,?,?,?,?,? FROM users u "
+            "WHERE u.username=? AND u.principal_type='service' AND u.enabled=1",
+            (token_id, self.token_hash(raw), label, username, zone,
              json.dumps(normalized, separators=(",", ":")), now, expires_at, created_by,
-             project_id, username, *(role for permission in normalized for role in role_checks[permission][1])),
+             username),
         )
         try:
             if audit is None:
@@ -116,7 +101,7 @@ class ServiceTokens:
                 row["principal_enabled"] == 0 or row.get("local_enabled") == 0):
             raise AuthenticationError("invalid or expired service token")
         self.store.execute("UPDATE service_tokens SET last_used_at=? WHERE id=?", (now, row["id"]))
-        return Identity(row["username"], "service", row["id"], row["project_id"], row["zone"],
+        return Identity(row["username"], "service", row["id"], row["zone"],
                         tuple(json.loads(row["permissions"])))
 
     def revoke(self, token_id: str):

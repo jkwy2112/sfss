@@ -67,13 +67,14 @@ class ServiceTest(unittest.TestCase):
     def upload(self, filename, body):
         return self.service.upload("chip-a", filename, io.BytesIO(body), len(body), "alice")
 
-    def secure_production_settings(self):
+    def secure_production_settings(self, deployment_mode="inbound"):
         ca_file = self.settings.data_dir / "ldap-ca.pem"
         ca_file.write_text("test CA placeholder", encoding="utf-8"); ca_file.chmod(0o600)
         manifest_key_file = self.settings.data_dir / "manifest-hmac.key"
         manifest_key_file.write_text("x" * 32, encoding="utf-8"); manifest_key_file.chmod(0o600)
         candidate = replace(
-            self.settings, environment="production", auth_backend="ldap", dev_tokens_enabled=False,
+            self.settings, environment="production", deployment_mode=deployment_mode,
+            auth_backend="ldap", dev_tokens_enabled=False,
             scanners="clamav", require_trusted_proxy=True, trusted_zone_proxy_cidrs="127.0.0.1/32",
             require_forwarded_https=True, manifest_hmac_key="x" * 32,
             manifest_hmac_key_file=str(manifest_key_file), ldap_uri="ldaps://ad.example:636",
@@ -667,11 +668,12 @@ class ServiceTest(unittest.TestCase):
 
     def test_production_core_requires_runtime_unix_socket(self):
         settings = self.secure_production_settings()
-        validate_listener(settings, None, "/run/sfss/sfss.sock")
+        validate_listener(settings, None, "/run/sfss-inbound/sfss.sock")
         for host in ("127.0.0.1", "::1", "0.0.0.0", "localhost"):
             with self.subTest(host=host), self.assertRaisesRegex(ValueError, "unix-socket"):
                 validate_listener(settings, host, None)
-        for path in ("relative.sock", "/tmp/sfss.sock", "/run/other/sfss.sock"):
+        for path in ("relative.sock", "/tmp/sfss.sock", "/run/other/sfss.sock",
+                     "/run/sfss/sfss.sock", "/run/sfss-outbound/sfss.sock"):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 validate_listener(settings, None, path)
         validate_bind_host(settings, "127.0.0.1")
@@ -779,20 +781,22 @@ class ServiceTest(unittest.TestCase):
             settings.validate()
 
     def test_production_startup_rejects_persisted_enabled_local_approval(self):
+        self.store.execute("DELETE FROM memberships WHERE role!='admin'")
         self.store.execute(
             "INSERT INTO outbound_policies(project_id,enabled,approval_provider,updated_at,updated_by) "
             "VALUES('chip-a',1,'local',1,'admin')")
         with self.assertRaisesRegex(ValueError, "persisted production policy"):
             with patch("sfss.config.platform.python_version", return_value="3.12.12"):
-                create_runtime(self.secure_production_settings())
+                create_runtime(self.secure_production_settings("outbound"))
 
     def test_startup_rejects_enabled_wecom_policy_without_safe_relay(self):
+        self.store.execute("DELETE FROM memberships WHERE role!='admin'")
         self.store.execute(
             "INSERT INTO outbound_policies(project_id,enabled,approval_provider,updated_at,updated_by) "
             "VALUES('chip-a',1,'wecom',1,'admin')")
         with self.assertRaisesRegex(ValueError, "unsafe persisted approval relay configuration"):
             with patch("sfss.config.platform.python_version", return_value="3.12.12"):
-                create_runtime(self.secure_production_settings())
+                create_runtime(self.secure_production_settings("outbound"))
 
     def test_production_ldap_rejects_local_password_database(self):
         LocalAuthenticator({}, {"admin":"admin123"}, self.store, 3600)

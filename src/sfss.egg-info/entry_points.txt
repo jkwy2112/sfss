@@ -1,0 +1,4 @@
+[console_scripts]
+sfss = sfss.server:main
+sfss-admin = sfss.operations:main
+sfss-agent = sfss.agent:main

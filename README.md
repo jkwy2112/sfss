@@ -6,6 +6,15 @@ SFSS is a runnable first-phase foundation for a Fabless-oriented controlled file
 
 This repository is **not a production security guarantee**. The default scanner is a development mock and the standard-library HTTP server has no TLS termination. The current SQLite-backed scan queue is restart-durable for a single node, but it is not an HA broker. Deploy default mode only as a development/evaluation service until the controls in “Known limits” are addressed.
 
+## Two-system production split
+
+Production deploys SFSS as two independently operated single-purpose systems, selected with `SFSS_DEPLOYMENT_MODE`:
+
+- **Inbound system (`SFSS_DEPLOYMENT_MODE=inbound`)**: 绿区上传 + 红区下载 — `green upload -> isolated storage -> content detection + asynchronous scanning -> released buffer -> red read-only download`. It serves no outbound route, role, token scope, job kind, or database record; each returns 404/400 or fails startup.
+- **Outbound system (`SFSS_DEPLOYMENT_MODE=outbound`)**: 红区上传 + 外发 — `red upload -> outbound isolation -> scanners -> classifier -> approval (WeCom relay) -> released-green buffer -> green download`. It serves no inbound route, role, token scope, job kind, or database record.
+
+Each system has its own data directory (`/srv/sfss-inbound`, `/srv/sfss-outbound`), Unix socket (`/run/sfss-inbound/sfss.sock`, `/run/sfss-outbound/sfss.sock`), database, projects/memberships, service tokens, audit chain, and deployment templates under `deploy/`. Production validation rejects `combined` mode, and startup fails closed if a data directory contains records of the other workflow, so systems cannot share or silently migrate state. The local combined mode (`SFSS_DEPLOYMENT_MODE=combined`, the default) remains a development/evaluation convenience only. See [deploy/README.md](deploy/README.md) for the split placement and per-system drill.
+
 Use the [production acceptance gate](docs/PRODUCTION_ACCEPTANCE.md) to distinguish a tested candidate build from an approved deployment. Missing target-environment evidence is a release blocker, not a documentation exception.
 
 ## Run locally
