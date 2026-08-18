@@ -116,10 +116,10 @@ class AgentTest(unittest.TestCase):
     def test_complete_partial_still_requires_authorized_signed_head(self):
         with tempfile.TemporaryDirectory() as temp:
             payload = b"complete partial"; digest = hashlib.sha256(payload).hexdigest()
-            record = {"id":"o1", "project_id":"p1", "filename":"payload.bin", "size":len(payload),
+            record = {"id":"o1", "filename":"payload.bin", "size":len(payload),
                       "sha256":digest, "state":"released"}
             output = Path(temp) / "result.bin"; partial = Path(str(output) + ".part"); partial.write_bytes(payload)
-            key = "manifest-secret"; manifest = f'o1\np1\n{len(payload)}\n{digest}'
+            key = "manifest-secret"; manifest = f'o1\n{len(payload)}\n{digest}'
             signature = hmac.new(key.encode(), manifest.encode(), hashlib.sha256).hexdigest()
             calls = []
             class Response:
@@ -132,7 +132,7 @@ class AgentTest(unittest.TestCase):
                     calls.append(method); return Response()
             args = SimpleNamespace(direction="inbound", server="https://sfss.invalid", token="token",
                                    allow_http=False, proxy=None, timeout=3600, ca_file=None,
-                                   client_cert=None, client_key=None, project="p1", object_id="o1",
+                                   client_cert=None, client_key=None, object_id="o1",
                                    output=str(output), overwrite=False, allow_unsigned=False)
             with patch("sfss.agent.API", return_value=FakeAPI()), patch.dict(os.environ, {"SFSS_AGENT_MANIFEST_KEY":key}), contextlib.redirect_stdout(io.StringIO()):
                 download(args)
@@ -145,7 +145,7 @@ class AgentTest(unittest.TestCase):
             source = Path(temp) / "payload.txt"; source.write_bytes(b"payload")
             state = Path(temp) / "state.json"
             digest = hashlib.sha256(b"payload").hexdigest()
-            save_state(state, {"server":"https://sfss.invalid", "project":"p1", "direction":"inbound",
+            save_state(state, {"server":"https://sfss.invalid", "direction":"inbound",
                                "upload_id":"u1", "file":file_identity(source),
                                "expected_sha256":digest})
             calls = []
@@ -156,7 +156,7 @@ class AgentTest(unittest.TestCase):
                     if path.endswith("/complete"): return {"id":"o1", "state":"released"}
                     raise AssertionError("a new upload session must not be created")
             args = SimpleNamespace(file=str(source), direction="inbound", server="https://sfss.invalid",
-                                   token="token", allow_http=False, proxy=None, state_file=str(state), project="p1",
+                                   token="token", allow_http=False, proxy=None, state_file=str(state),
                                    ca_file=None, client_cert=None, client_key=None, parallel=1)
             with patch("sfss.agent.API", return_value=FakeAPI()), contextlib.redirect_stdout(io.StringIO()):
                 upload(args)
@@ -183,7 +183,7 @@ class AgentTest(unittest.TestCase):
                     self.uploaded = b"".join(body); return Response()
             fake = FakeAPI()
             args = SimpleNamespace(file=str(source), direction="inbound", server="https://sfss.invalid",
-                                   token="token", allow_http=False, proxy=None, state_file=None, project="p1",
+                                   token="token", allow_http=False, proxy=None, state_file=None,
                                    ca_file=None, client_cert=None, client_key=None, parallel=1, timeout=3600)
             with patch("sfss.agent.API", return_value=fake), contextlib.redirect_stdout(io.StringIO()):
                 upload(args)

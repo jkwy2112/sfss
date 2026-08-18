@@ -253,6 +253,8 @@ class SFSSService:
             raise ServiceError(404, "upload session not found")
         if session["actor"] != actor and not self.store.is_global_admin(actor):
             raise ServiceError(403, "upload session permission denied")
+        if not self.store.is_global_admin(actor):
+            self._require_active_user(actor)
         parts = self.store.all(
             "SELECT part_number,offset,size,sha256,completed_at FROM upload_parts WHERE upload_id=? ORDER BY part_number",
             (upload_id,),

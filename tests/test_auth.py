@@ -136,23 +136,18 @@ class AuthTest(unittest.TestCase):
         self.assertEqual(0, self.store.one(
             "SELECT COUNT(*) AS value FROM auth_sessions")["value"])
 
-    def test_service_token_insert_rechecks_current_role_and_cannot_resurrect(self):
-        self.store.execute("INSERT INTO projects(id,name,created_at) VALUES('p1','P1',1)")
+    def test_service_token_insert_rechecks_enabled_identity_and_cannot_resurrect(self):
         self.store.execute("INSERT INTO users(username,principal_type,enabled) VALUES('agent','service',1)")
-        self.store.execute(
-            "INSERT INTO memberships(project_id,username,role) VALUES('p1','agent','uploader')")
         original = self.store.transaction
-        def revoke_role_before_commit(statements, **kwargs):
-            self.store.execute(
-                "DELETE FROM memberships WHERE project_id='p1' AND username='agent'")
+        def disable_identity_before_commit(statements, **kwargs):
+            self.store.execute("UPDATE users SET enabled=0 WHERE username='agent'")
             return original(statements, **kwargs)
-        with patch.object(self.store, "transaction", side_effect=revoke_role_before_commit):
+        with patch.object(self.store, "transaction", side_effect=disable_identity_before_commit):
             with self.assertRaisesRegex(ValueError, "no longer authorized"):
                 ServiceTokens(self.store).issue(
-                    label="raced", username="agent", project_id="p1", zone="green",
+                    label="raced", username="agent", zone="green",
                     permissions=["inbound_upload"], expires_at=2 ** 31, created_by="admin")
-        self.store.execute(
-            "INSERT INTO memberships(project_id,username,role) VALUES('p1','agent','uploader')")
+        self.store.execute("UPDATE users SET enabled=1 WHERE username='agent'")
         self.assertEqual(0, self.store.one(
             "SELECT COUNT(*) AS value FROM service_tokens")["value"])
 
@@ -170,12 +165,9 @@ class AuthTest(unittest.TestCase):
                 auth._bind(username, "password")
 
     def test_service_token_is_hashed_scoped_and_revocable(self):
-        self.store.execute("INSERT INTO projects(id,name,created_at) VALUES('p1','P1',1)")
         self.store.execute("INSERT INTO users(username,principal_type,enabled) VALUES('red-agent','service',1)")
-        self.store.execute(
-            "INSERT INTO memberships(project_id,username,role) VALUES('p1','red-agent','downloader')")
         raw, record = ServiceTokens(self.store).issue(
-            label="red downloader", username="red-agent", project_id="p1", zone="red",
+            label="red downloader", username="red-agent", zone="red",
             permissions=["inbound_download"], expires_at=2 ** 31, created_by="admin",
         )
         stored = self.store.one("SELECT token_hash FROM service_tokens WHERE id=?", (record["id"],))

@@ -283,7 +283,7 @@ def verify_audit_export(source: Path, expected_sha256: str = "",
     try: descriptor = os.open(str(source), flags)
     except OSError as exc: raise OperationError("could not safely open audit export") from exc
     digest = hashlib.sha256(); head = ""; count = 0; previous_id = 0
-    required_event_fields = {"id", "timestamp", "request_id", "actor", "action", "project_id",
+    required_event_fields = {"id", "timestamp", "request_id", "actor", "action",
                              "object_id", "outcome", "source_zone", "remote_addr", "details"}
     try:
         before = os.fstat(descriptor)
@@ -317,7 +317,7 @@ def verify_audit_export(source: Path, expected_sha256: str = "",
                         any(not isinstance(event.get(name), str) for name in
                             ("request_id", "actor", "action", "outcome", "source_zone", "remote_addr", "details")) or
                         any(event.get(name) is not None and not isinstance(event.get(name), str)
-                            for name in ("project_id", "object_id"))):
+                            for name in ("object_id",))):
                     raise OperationError("audit export event value types are invalid")
                 try: detail_value = json.loads(event["details"])
                 except json.JSONDecodeError as exc:
@@ -437,13 +437,13 @@ def preflight(settings: Settings, require_production: bool = True):
                 (int(time.time()), settings.service_token_max_ttl_seconds)):
                 identity_errors.append("an active service token exceeds the maximum production lifetime")
             if settings.environment == "production" and store.one(
-                "SELECT project_id FROM outbound_policies WHERE enabled=1 AND approval_provider='local' LIMIT 1"):
-                identity_errors.append("an enabled project still uses local outbound approval")
+                "SELECT id FROM outbound_policy WHERE enabled=1 AND approval_provider='local' LIMIT 1"):
+                identity_errors.append("the enabled platform outbound policy still uses local approval")
             record("identity_policy", {"status":"error" if identity_errors else "ok",
                                        "detail":"; ".join(identity_errors) if identity_errors else "persisted identity and approval policy accepted"})
 
             relay_required = bool(store.one(
-                "SELECT project_id FROM outbound_policies WHERE enabled=1 AND approval_provider='wecom' LIMIT 1"))
+                "SELECT id FROM outbound_policy WHERE enabled=1 AND approval_provider='wecom' LIMIT 1"))
             relay_errors = settings.approval_relay_errors() if relay_required else []
             record("approval_relay", {"status":"error" if relay_errors else "ok",
                                       "required":relay_required,

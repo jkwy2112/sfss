@@ -95,63 +95,55 @@ def main():
         inbound = start_system(repo, "inbound", port_in, base / "inbound")
         outbound = start_system(repo, "outbound", port_out, base / "outbound")
 
-        # ---- System 1 (inbound): project, green upload, red download ----
-        api(port_in, "POST", "/v1/projects", "dev-admin",
-            body=json.dumps({"id": "chip-a", "name": "Chip A"}).encode(), expect=201)
-        for username, role in (("alice", "uploader"), ("reader", "downloader")):
-            api(port_in, "POST", "/v1/projects/chip-a/members", "dev-admin",
-                body=json.dumps({"username": username, "role": role}).encode(), expect=204)
+        # ---- System 1 (inbound): personal-space green upload, red download ----
         payload = b"green zone netlist"
-        status, body = api(port_in, "POST", "/v1/projects/chip-a/objects", "dev-alice",
+        status, body = api(port_in, "POST", "/v1/objects", "dev-alice",
                            "green", "netlist.txt", payload, expect=202)
         object_id = json.loads(body)["id"]
         object_id = wait_state(
-            port_in, f"/v1/projects/chip-a/objects/{object_id}", "dev-reader", "red",
+            port_in, f"/v1/objects/{object_id}", "dev-alice", "red",
             lambda record: record["state"] == "released", lambda record: record["id"])
         status, downloaded = api(port_in, "GET",
-                                 f"/v1/projects/chip-a/objects/{object_id}/download",
-                                 "dev-reader", "red", expect=200)
+                                 f"/v1/objects/{object_id}/download",
+                                 "dev-alice", "red", expect=200)
         assert downloaded == payload, "inbound payload mismatch"
         results.append(f"System1 inbound({port_in}): green upload -> release -> red download OK")
 
-        api(port_in, "GET", "/v1/projects/chip-a/outbound", "dev-alice", "red", expect=404)
-        api(port_in, "GET", "/v1/projects/chip-a/outbound-policy", "dev-alice", "red", expect=404)
+        api(port_in, "GET", "/v1/outbound", "dev-alice", "red", expect=404)
+        api(port_in, "PUT", "/v1/admin/outbound-policy", "dev-admin",
+            body=json.dumps({"enabled": True}).encode(), expect=404)
         results.append(f"System1 inbound({port_in}): outbound routes rejected with 404")
 
-        # ---- System 2 (outbound): project, red upload, approve, green download ----
-        api(port_out, "POST", "/v1/projects", "dev-admin",
-            body=json.dumps({"id": "chip-a", "name": "Chip A"}).encode(), expect=201)
-        for username, role in (("alice", "red_uploader"), ("admin", "approver"),
-                               ("reader", "green_downloader")):
-            api(port_out, "POST", "/v1/projects/chip-a/members", "dev-admin",
-                body=json.dumps({"username": username, "role": role}).encode(), expect=204)
-        api(port_out, "PUT", "/v1/projects/chip-a/outbound-policy", "dev-admin",
+        # ---- System 2 (outbound): red upload, platform approver, green download ----
+        api(port_out, "PUT", "/v1/admin/outbound-policy", "dev-admin",
             body=json.dumps({"enabled": True, "approval_provider": "local",
                              "allowed_classifications": ["GENERAL"],
                              "approval_timeout_hours": 24,
                              "download_ttl_hours": 24}).encode(), expect=200)
         payload = b"red zone handoff text"
-        status, body = api(port_out, "POST", "/v1/projects/chip-a/outbound", "dev-alice",
+        status, body = api(port_out, "POST", "/v1/outbound", "dev-alice",
                            "red", "handoff.txt", payload, expect=202)
         transfer_id = json.loads(body)["id"]
         transfer_id = wait_state(
-            port_out, "/v1/projects/chip-a/outbound", "dev-alice", "red",
+            port_out, "/v1/outbound", "dev-alice", "red",
             lambda data: any(row["id"] == transfer_id and row["state"] == "pending_approval"
                              for row in data["transfers"]),
             lambda data: transfer_id)
         status, body = api(port_out, "POST",
-                           f"/v1/projects/chip-a/outbound/{transfer_id}/decision", "dev-admin",
+                           f"/v1/outbound/{transfer_id}/decision", "dev-admin",
                            body=json.dumps({"approved": True, "comment": "smoke"}).encode(),
                            expect=200)
         assert json.loads(body)["state"] == "released_to_green"
+        api(port_out, "GET",
+           f"/v1/outbound/{transfer_id}/download", "dev-reader", "green", expect=404)
         status, downloaded = api(port_out, "GET",
-                                 f"/v1/projects/chip-a/outbound/{transfer_id}/download",
-                                 "dev-reader", "green", expect=200)
+                                 f"/v1/outbound/{transfer_id}/download",
+                                 "dev-alice", "green", expect=200)
         assert downloaded == payload, "outbound payload mismatch"
         results.append(f"System2 outbound({port_out}): red upload -> approve -> green download OK")
 
-        api(port_out, "GET", "/v1/projects/chip-a/objects", "dev-alice", "green", expect=404)
-        api(port_out, "POST", "/v1/projects/chip-a/objects", "dev-alice", "green",
+        api(port_out, "GET", "/v1/objects", "dev-alice", "green", expect=404)
+        api(port_out, "POST", "/v1/objects", "dev-alice", "green",
             "x.txt", b"x", expect=404)
         results.append(f"System2 outbound({port_out}): inbound routes rejected with 404")
 

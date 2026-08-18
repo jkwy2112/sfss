@@ -56,16 +56,14 @@ class ServiceTest(unittest.TestCase):
         self.store.ensure_user("alice")
         self.store.ensure_user("reader")
         self.store.ensure_user("approver")
+        self.store.execute("UPDATE users SET approver=1 WHERE username IN ('admin','approver')")
         self.service = SFSSService(self.settings, self.store, [MockScanner()], InlineJobQueue())
-        self.service.create_project("chip-a", "Chip A", "admin")
-        self.service.add_member("chip-a", "alice", "uploader", "admin")
-        self.service.add_member("chip-a", "reader", "downloader", "admin")
 
     def tearDown(self):
         self.temp.cleanup()
 
     def upload(self, filename, body):
-        return self.service.upload("chip-a", filename, io.BytesIO(body), len(body), "alice")
+        return self.service.upload(filename, io.BytesIO(body), len(body), "alice")
 
     def secure_production_settings(self, deployment_mode="inbound"):
         ca_file = self.settings.data_dir / "ldap-ca.pem"
@@ -92,22 +90,22 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual("released", obj["state"])
         self.assertEqual("text/plain", obj["media_type"])
         self.assertEqual(64, len(obj["sha256"]))
-        downloaded = self.service.object_for_download("chip-a", obj["id"], "reader")
+        downloaded = self.service.object_for_download(obj["id"], "alice")
         self.assertEqual(b"hello secure shuttle\n", Path(downloaded["storage_path"]).read_bytes())
 
     def test_content_extension_conflict_is_quarantined(self):
         obj = self.upload("deceptive.pdf", b"PK\x03\x04archive")
         self.assertEqual("quarantined", obj["state"])
         with self.assertRaises(ServiceError):
-            self.service.object_for_download("chip-a", obj["id"], "reader")
+            self.service.object_for_download(obj["id"], "reader")
 
     def test_deceptive_or_nonportable_filenames_are_rejected_at_service_boundary(self):
         invalid = ("../escape.txt", "folder/file.txt", "folder\\file.txt", " report.txt",
                    "report.txt ", "safe\u202egnp.exe", "zero\u200bwidth.txt", "line\nbreak.txt", "e\u0301.txt")
         for filename in invalid:
             with self.subTest(filename=filename), self.assertRaisesRegex(ServiceError, "invalid filename"):
-                self.service.create_upload_session("chip-a", "inbound", filename, 1, "alice")
-        session = self.service.create_upload_session("chip-a", "inbound", "芯片设计.txt", 1, "alice")
+                self.service.create_upload_session("inbound", filename, 1, "alice")
+        session = self.service.create_upload_session("inbound", "芯片设计.txt", 1, "alice")
         self.assertEqual("芯片设计.txt", session["filename"])
 
     def test_unknown_binary_is_quarantined(self):
@@ -120,17 +118,17 @@ class ServiceTest(unittest.TestCase):
 
     def test_scanner_error_fails_closed(self):
         service = SFSSService(self.settings, self.store, [ErrorScanner()], InlineJobQueue())
-        obj = service.upload("chip-a", "notes.txt", io.BytesIO(b"safe looking"), 12, "alice")
+        obj = service.upload("notes.txt", io.BytesIO(b"safe looking"), 12, "alice")
         self.assertEqual("quarantined", obj["state"])
 
     def test_scanner_exception_fails_closed(self):
         service = SFSSService(self.settings, self.store, [RaisingScanner()], InlineJobQueue())
-        obj = service.upload("chip-a", "notes.txt", io.BytesIO(b"safe looking"), 12, "alice")
+        obj = service.upload("notes.txt", io.BytesIO(b"safe looking"), 12, "alice")
         self.assertEqual("quarantined", obj["state"])
 
     def test_inbound_payload_changed_by_scanner_is_quarantined_before_release(self):
         service = SFSSService(self.settings, self.store, [MutatingCleanScanner()], InlineJobQueue())
-        obj = service.upload("chip-a", "notes.txt", io.BytesIO(b"safe looking"), 12, "alice")
+        obj = service.upload("notes.txt", io.BytesIO(b"safe looking"), 12, "alice")
         self.assertEqual("quarantined", obj["state"])
         self.assertIn("post-scan-integrity", obj["scan_detail"])
 
@@ -139,7 +137,7 @@ class ServiceTest(unittest.TestCase):
         self.service.scanners = [MutatingCleanScanner()]
         body = b"safe outbound text"
         transfer = self.service.upload_outbound(
-            "chip-a", "handoff.txt", io.BytesIO(body), len(body), "alice")
+            "handoff.txt", io.BytesIO(body), len(body), "alice")
         self.assertEqual("quarantined", transfer["state"])
         self.assertIsNone(transfer["approval_id"])
         self.assertIn("post-scan-integrity", transfer["scan_detail"])
@@ -163,20 +161,22 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual("quarantined", current["state"])
         self.assertEqual("runtime-policy", json.loads(current["scan_detail"])[0]["scanner"])
 
-    def test_platform_admin_does_not_bypass_project_file_role(self):
+    def test_only_owner_and_platform_admin_reach_personal_files(self):
         obj = self.upload("notes.txt", b"safe")
-        self.store.ensure_user("platform-operator", True)
         with self.assertRaises(ServiceError):
-            self.service.object_for_download("chip-a", obj["id"], "platform-operator")
+            self.service.object_for_download(obj["id"], "reader")
+        self.store.ensure_user("platform-operator", True)
+        downloaded = self.service.object_for_download(obj["id"], "platform-operator")
+        self.assertEqual(obj["id"], downloaded["id"])
 
-    def test_project_rbac_denies_uploader_download(self):
+    def test_personal_space_denies_other_users(self):
         obj = self.upload("notes.txt", b"safe")
         with self.assertRaises(ServiceError) as context:
-            self.service.object_for_download("chip-a", obj["id"], "alice")
-        self.assertEqual(403, context.exception.status)
+            self.service.object_for_download(obj["id"], "reader")
+        self.assertEqual(404, context.exception.status)
 
     def test_audit_is_append_only(self):
-        self.store.audit(request_id="r1", actor="alice", action="test", project_id="chip-a",
+        self.store.audit(request_id="r1", actor="alice", action="test", 
                          object_id=None, outcome="success", source_zone="green",
                          remote_addr="127.0.0.1", details={})
         verification = self.store.verify_audit_chain()
@@ -186,7 +186,7 @@ class ServiceTest(unittest.TestCase):
             self.store.execute("DELETE FROM audit_events")
 
     def test_offline_audit_tampering_is_detected_on_startup(self):
-        self.store.audit(request_id="r1", actor="alice", action="test", project_id="chip-a",
+        self.store.audit(request_id="r1", actor="alice", action="test", 
                          object_id=None, outcome="success", source_zone="green",
                          remote_addr="127.0.0.1", details={})
         with self.store.connect() as db:
@@ -210,10 +210,10 @@ class ServiceTest(unittest.TestCase):
     def test_approval_comment_length_is_bounded_before_persistence(self):
         self.enable_outbound(); body = b"approval comment"
         transfer = self.service.upload_outbound(
-            "chip-a", "comment.txt", io.BytesIO(body), len(body), "alice")
+            "comment.txt", io.BytesIO(body), len(body), "alice")
         with self.assertRaisesRegex(ServiceError, "comment is too long"):
             self.service.decide_outbound(
-                "chip-a", transfer["id"], True, "x" * 1001, "approver")
+                transfer["id"], True, "x" * 1001, "approver")
         self.assertEqual("pending_approval", self.service.get_outbound(transfer["id"])["state"])
 
     def test_invalid_state_transition_is_rejected(self):
@@ -224,7 +224,7 @@ class ServiceTest(unittest.TestCase):
     def test_state_change_rolls_back_when_chained_audit_cannot_commit(self):
         queue = HoldingQueue()
         service = SFSSService(self.settings, self.store, [MockScanner()], queue)
-        obj = service.upload("chip-a", "atomic.txt", io.BytesIO(b"atomic audit"), 12, "alice")
+        obj = service.upload("atomic.txt", io.BytesIO(b"atomic audit"), 12, "alice")
         before_events = self.store.one("SELECT COUNT(*) AS value FROM audit_events")["value"]
         with patch.object(self.store, "_append_audit", side_effect=RuntimeError("audit unavailable")):
             with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
@@ -237,7 +237,7 @@ class ServiceTest(unittest.TestCase):
         outbound_service = SFSSService(self.settings, self.store, [MockScanner()], HoldingQueue())
         body = b"outbound atomic"
         transfer = outbound_service.upload_outbound(
-            "chip-a", "atomic.txt", io.BytesIO(body), len(body), "alice")
+            "atomic.txt", io.BytesIO(body), len(body), "alice")
         with patch.object(self.store, "_append_audit", side_effect=RuntimeError("audit unavailable")):
             with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
                 outbound_service.outbound_transition(transfer["id"], "scanning")
@@ -246,18 +246,18 @@ class ServiceTest(unittest.TestCase):
     def test_upload_creation_and_part_commit_roll_back_when_audit_fails(self):
         before = self.store.one("SELECT COUNT(*) AS value FROM objects")["value"]
         audit = {"request_id":"upload-failure", "actor":"alice", "action":"object.upload",
-                 "project_id":"chip-a", "object_id":None, "outcome":"accepted",
+                 "object_id":None, "outcome":"accepted",
                  "source_zone":"green", "remote_addr":"127.0.0.1", "details":{}}
         with patch.object(self.store, "_append_audit", side_effect=RuntimeError("audit unavailable")):
             with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
-                self.service.upload("chip-a", "atomic.txt", io.BytesIO(b"atomic"), 6,
+                self.service.upload("atomic.txt", io.BytesIO(b"atomic"), 6,
                                     "alice", audit=audit)
         self.assertEqual(before, self.store.one("SELECT COUNT(*) AS value FROM objects")["value"])
 
         session = self.service.create_upload_session(
-            "chip-a", "inbound", "part.txt", 4, "alice")
+            "inbound", "part.txt", 4, "alice")
         part_audit = {"request_id":"part-failure", "actor":"alice",
-                      "action":"upload.part.complete", "project_id":"chip-a",
+                      "action":"upload.part.complete",
                       "object_id":session["id"], "outcome":"success", "source_zone":"green",
                       "remote_addr":"127.0.0.1", "details":{"part_number":1}}
         with patch.object(self.store, "_append_audit", side_effect=RuntimeError("audit unavailable")):
@@ -272,29 +272,34 @@ class ServiceTest(unittest.TestCase):
             hashlib.sha256(b"part").hexdigest(), "alice")
         self.assertEqual(1, retry["part_number"])
 
-    def test_member_role_can_be_revoked_but_last_admin_is_protected(self):
-        self.service.remove_member("chip-a", "alice", "uploader", "admin")
-        self.assertEqual(set(), self.store.roles("chip-a", "alice"))
+    def test_platform_approver_role_can_be_granted_and_revoked(self):
+        self.assertFalse(self.store.is_approver("alice"))
+        self.store.execute("UPDATE users SET approver=1 WHERE username='alice'")
+        self.assertTrue(self.store.is_approver("alice"))
         with self.assertRaises(ServiceError):
-            self.service.remove_member("chip-a", "admin", "admin", "admin")
+            self.service.decide_outbound("nonexistent", True, "comment", "reader")
+        self.store.execute("UPDATE users SET approver=0 WHERE username='alice'")
+        self.assertFalse(self.store.is_approver("alice"))
 
-    def test_membership_token_revocation_rolls_back_when_audit_fails(self):
+    def test_service_identity_disable_revokes_derived_tokens_atomically(self):
         self.store.execute(
             "INSERT INTO users(username,principal_type,enabled) VALUES('green-agent','service',1)")
-        self.service.add_member("chip-a", "green-agent", "uploader", "admin")
         raw, _ = ServiceTokens(self.store).issue(
-            label="atomic membership", username="green-agent", project_id="chip-a",
+            label="atomic identity", username="green-agent",
             zone="green", permissions=["inbound_upload"], expires_at=2 ** 31,
             created_by="admin")
-        audit = {"request_id":"membership-failure", "actor":"admin",
-                 "action":"membership.remove", "project_id":"chip-a", "object_id":None,
+        self.assertEqual("green-agent", ServiceTokens(self.store).authenticate(raw).username)
+        audit = {"request_id":"identity-failure", "actor":"admin",
+                 "action":"admin.service_identity.update", "object_id":None,
                  "outcome":"success", "source_zone":"admin", "remote_addr":"127.0.0.1",
-                 "details":{"username":"green-agent", "role":"uploader"}}
+                 "details":{"username":"green-agent", "enabled":False}}
         with patch.object(self.store, "_append_audit", side_effect=RuntimeError("audit unavailable")):
             with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
-                self.service.remove_member(
-                    "chip-a", "green-agent", "uploader", "admin", audit=audit)
-        self.assertIn("uploader", self.store.roles("chip-a", "green-agent"))
+                self.store.execute_audited(
+                    "UPDATE users SET enabled=0 WHERE username=?", ("green-agent",),
+                    error="service identity disappeared", audit=audit)
+        self.assertEqual(1, self.store.one(
+            "SELECT enabled FROM users WHERE username='green-agent'")["enabled"])
         self.assertEqual("green-agent", ServiceTokens(self.store).authenticate(raw).username)
 
     def test_quarantined_object_can_be_rescanned_and_released_object_expired(self):
@@ -306,42 +311,39 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual("expired", self.service.get_object(released["id"])["state"])
 
     def enable_outbound(self):
-        self.service.add_member("chip-a", "alice", "red_uploader", "admin")
-        self.service.add_member("chip-a", "approver", "approver", "admin")
-        self.service.add_member("chip-a", "reader", "green_downloader", "admin")
-        self.service.set_outbound_policy("chip-a", {"enabled": True, "approval_provider": "local",
+        self.service.set_outbound_policy({"enabled": True, "approval_provider": "local",
             "allowed_classifications": ["GDS", "FPGA_BITFILE", "GENERAL"],
             "approval_timeout_hours": 24, "download_ttl_hours": 24}, "admin")
 
     def test_red_outbound_local_approval_to_green_download(self):
         self.enable_outbound(); body = b"approved general handoff"
-        transfer = self.service.upload_outbound("chip-a", "handoff.txt", io.BytesIO(body), len(body), "alice")
+        transfer = self.service.upload_outbound("handoff.txt", io.BytesIO(body), len(body), "alice")
         self.assertEqual("pending_approval", transfer["state"])
         self.assertEqual("GENERAL", transfer["classification"])
-        transfer = self.service.decide_outbound("chip-a", transfer["id"], True, "approved", "approver")
+        transfer = self.service.decide_outbound(transfer["id"], True, "approved", "approver")
         self.assertEqual("released_to_green", transfer["state"])
-        downloaded = self.service.outbound_for_download("chip-a", transfer["id"], "reader")
+        downloaded = self.service.outbound_for_download(transfer["id"], "alice")
         self.assertEqual(body, Path(downloaded["storage_path"]).read_bytes())
 
     def test_unknown_outbound_is_quarantined_and_cannot_be_approved(self):
         self.enable_outbound(); body = b"\x00\x01\x02\x03"
-        transfer = self.service.upload_outbound("chip-a", "layout.bin", io.BytesIO(body), len(body), "alice")
+        transfer = self.service.upload_outbound("layout.bin", io.BytesIO(body), len(body), "alice")
         self.assertEqual("quarantined", transfer["state"])
         with self.assertRaises(ServiceError):
-            self.service.decide_outbound("chip-a", transfer["id"], True, "", "approver")
+            self.service.decide_outbound(transfer["id"], True, "", "approver")
 
     def test_outbound_rejection_never_releases(self):
         self.enable_outbound(); body = b"reject this handoff"
-        transfer = self.service.upload_outbound("chip-a", "handoff.txt", io.BytesIO(body), len(body), "alice")
-        transfer = self.service.decide_outbound("chip-a", transfer["id"], False, "policy denied", "approver")
+        transfer = self.service.upload_outbound("handoff.txt", io.BytesIO(body), len(body), "alice")
+        transfer = self.service.decide_outbound(transfer["id"], False, "policy denied", "approver")
         self.assertEqual("approval_rejected", transfer["state"])
         with self.assertRaises(ServiceError):
-            self.service.outbound_for_download("chip-a", transfer["id"], "reader")
+            self.service.outbound_for_download(transfer["id"], "reader")
 
     def test_production_runtime_drift_blocks_approved_outbound_promotion(self):
         self.enable_outbound(); body = b"approved but runtime drifted"
         transfer = self.service.upload_outbound(
-            "chip-a", "handoff.txt", io.BytesIO(body), len(body), "alice")
+            "handoff.txt", io.BytesIO(body), len(body), "alice")
         self.store.execute("UPDATE outbound_transfers SET state='approved' WHERE id=?", (transfer["id"],))
         secret = self.settings.data_dir / "outbound-runtime-manifest.key"
         secret.write_text("m" * 32, encoding="utf-8"); secret.chmod(0o600)
@@ -364,7 +366,7 @@ class ServiceTest(unittest.TestCase):
         self.enable_outbound()
         body = (b"\x00\x06\x00\x02\x02\x58" + b"\x00\x1c\x01\x02" + (b"\x00" * 24) +
                 b"\x00\x08\x02\x06LIB\x00")
-        transfer = self.service.upload_outbound("chip-a", "layout.binary", io.BytesIO(body), len(body), "alice")
+        transfer = self.service.upload_outbound("layout.binary", io.BytesIO(body), len(body), "alice")
         self.assertEqual("pending_approval", transfer["state"])
         self.assertEqual("GDS", transfer["classification"])
 
@@ -375,7 +377,7 @@ class ServiceTest(unittest.TestCase):
         for name, body in (("weak.gds", weak_gds), ("weak.bit", weak_fpga)):
             with self.subTest(name=name):
                 transfer = self.service.upload_outbound(
-                    "chip-a", name, io.BytesIO(body), len(body), "alice")
+                    name, io.BytesIO(body), len(body), "alice")
                 self.assertEqual("quarantined", transfer["state"])
                 self.assertIsNone(transfer["classification"])
 
@@ -388,7 +390,7 @@ class ServiceTest(unittest.TestCase):
         payload = b"\xff\xff\xff\xff\xaa\x99\x55\x66"
         body = magic + fields + b"e" + len(payload).to_bytes(4, "big") + payload
         transfer = self.service.upload_outbound(
-            "chip-a", "design.bin", io.BytesIO(body), len(body), "alice")
+            "design.bin", io.BytesIO(body), len(body), "alice")
         self.assertEqual("pending_approval", transfer["state"])
         self.assertEqual("FPGA_BITFILE", transfer["classification"])
 
@@ -398,10 +400,10 @@ class ServiceTest(unittest.TestCase):
 
     def test_approval_move_failure_persists_recoverable_approved_state(self):
         self.enable_outbound(); body = b"safe handoff"
-        transfer = self.service.upload_outbound("chip-a", "handoff.txt", io.BytesIO(body), len(body), "alice")
+        transfer = self.service.upload_outbound("handoff.txt", io.BytesIO(body), len(body), "alice")
         with patch("sfss.service.os.replace", side_effect=OSError("disk unavailable")):
             with self.assertRaises(ServiceError):
-                self.service.decide_outbound("chip-a", transfer["id"], True, "ok", "approver")
+                self.service.decide_outbound(transfer["id"], True, "ok", "approver")
         self.assertEqual("approved", self.service.get_outbound(transfer["id"])["state"])
         recovered = self.service.run_maintenance()
         self.assertEqual(1, recovered["approved_release_retried"])
@@ -409,7 +411,7 @@ class ServiceTest(unittest.TestCase):
 
     def test_approved_release_recovers_crash_after_move_before_database_update(self):
         self.enable_outbound(); body = b"crash recovery handoff"
-        transfer = self.service.upload_outbound("chip-a", "recover.txt", io.BytesIO(body), len(body), "alice")
+        transfer = self.service.upload_outbound("recover.txt", io.BytesIO(body), len(body), "alice")
         self.service.outbound_transition(transfer["id"], "approved", approval_actor="approver",
                                          approval_comment="durable decision")
         target_dir = self.service.outbound_released / transfer["id"]
@@ -426,7 +428,7 @@ class ServiceTest(unittest.TestCase):
         settings = replace(self.settings, purge_grace_seconds=0)
         service = SFSSService(settings, self.store, [MockScanner()], InlineJobQueue())
         self.enable_outbound(); body = b"approval timeout"
-        transfer = service.upload_outbound("chip-a", "handoff.txt", io.BytesIO(body), len(body), "alice")
+        transfer = service.upload_outbound("handoff.txt", io.BytesIO(body), len(body), "alice")
         self.store.execute("UPDATE outbound_transfers SET approval_expires_at=0 WHERE id=?", (transfer["id"],))
         stats = service.run_maintenance()
         expired = service.get_outbound(transfer["id"])
@@ -440,27 +442,25 @@ class ServiceTest(unittest.TestCase):
 
     def test_policy_disable_blocks_pending_approval_and_green_download(self):
         self.enable_outbound(); body = b"policy changes"
-        transfer = self.service.upload_outbound("chip-a", "handoff.txt", io.BytesIO(body), len(body), "alice")
-        self.service.set_outbound_policy("chip-a", {"enabled": False, "approval_provider": "local",
+        transfer = self.service.upload_outbound("handoff.txt", io.BytesIO(body), len(body), "alice")
+        self.service.set_outbound_policy({"enabled": False, "approval_provider": "local",
             "allowed_classifications":["GENERAL"], "approval_timeout_hours":24, "download_ttl_hours":24}, "admin")
         with self.assertRaises(ServiceError):
-            self.service.decide_outbound("chip-a", transfer["id"], True, "", "approver")
+            self.service.decide_outbound(transfer["id"], True, "", "approver")
 
     def test_platform_policy_can_forbid_local_outbound_approval(self):
         locked = SFSSService(replace(self.settings, allow_local_approval=False), self.store,
                              [MockScanner()], InlineJobQueue())
         with self.assertRaisesRegex(ServiceError, "local outbound approval is disabled"):
-            locked.set_outbound_policy("chip-a", {"enabled":True, "approval_provider":"local",
+            locked.set_outbound_policy({"enabled":True, "approval_provider":"local",
                 "allowed_classifications":["GENERAL"], "approval_timeout_hours":24,
                 "download_ttl_hours":24}, "admin")
 
     def test_wecom_policy_requires_relay_and_cannot_be_decided_locally(self):
-        self.service.add_member("chip-a", "alice", "red_uploader", "admin")
-        self.service.add_member("chip-a", "approver", "approver", "admin")
         policy = {"enabled":True, "approval_provider":"wecom", "allowed_classifications":["GENERAL"],
                   "approval_timeout_hours":24, "download_ttl_hours":24}
         with self.assertRaisesRegex(ServiceError, "approval relay is not safely configured"):
-            self.service.set_outbound_policy("chip-a", policy, "admin")
+            self.service.set_outbound_policy(policy, "admin")
         files = []
         for name in ("relay-ca.pem", "relay-client.pem", "relay-key.pem"):
             path = self.settings.data_dir / name; path.write_text("fixture", encoding="utf-8"); files.append(str(path))
@@ -472,21 +472,21 @@ class ServiceTest(unittest.TestCase):
             approval_relay_callback_hmac_key="c" * 32,
         )
         service = SFSSService(configured, self.store, [MockScanner()], InlineJobQueue())
-        service.set_outbound_policy("chip-a", policy, "admin")
+        service.set_outbound_policy(policy, "admin")
         with patch("sfss.service.WeComApprovalProvider.create", return_value="relay-request-1"):
-            transfer = service.upload_outbound("chip-a", "relay.txt", io.BytesIO(b"relay payload"),
+            transfer = service.upload_outbound("relay.txt", io.BytesIO(b"relay payload"),
                                                len(b"relay payload"), "alice")
         self.assertEqual("pending_approval", transfer["state"])
         self.assertEqual("relay-request-1", transfer["approval_id"])
         with self.assertRaisesRegex(ServiceError, "cannot be decided locally"):
-            service.decide_outbound("chip-a", transfer["id"], True, "bypass", "approver")
+            service.decide_outbound(transfer["id"], True, "bypass", "approver")
 
     def test_download_integrity_failure_expires_tampered_payload(self):
         obj = self.upload("notes.txt", b"original")
         Path(obj["storage_path"]).chmod(0o600)
         Path(obj["storage_path"]).write_bytes(b"tampered")
         with self.assertRaises(ServiceError):
-            self.service.object_for_download("chip-a", obj["id"], "reader")
+            self.service.object_for_download(obj["id"], "alice")
         self.assertEqual("expired", self.service.get_object(obj["id"])["state"])
 
     def test_full_integrity_reader_never_follows_symbolic_links(self):
@@ -499,7 +499,7 @@ class ServiceTest(unittest.TestCase):
     def test_isolation_tampering_before_scan_is_quarantined(self):
         queue = HoldingQueue()
         service = SFSSService(self.settings, self.store, [MockScanner()], queue)
-        obj = service.upload("chip-a", "pending.txt", io.BytesIO(b"original"), 8, "alice")
+        obj = service.upload("pending.txt", io.BytesIO(b"original"), 8, "alice")
         path = Path(obj["storage_path"]); path.write_bytes(b"tampered")
         job, args = queue.jobs.pop(); job(*args)
         current = service.get_object(obj["id"])
@@ -508,10 +508,10 @@ class ServiceTest(unittest.TestCase):
 
     def test_outbound_tampering_after_scan_blocks_approval(self):
         self.enable_outbound(); body = b"safe handoff"
-        transfer = self.service.upload_outbound("chip-a", "handoff.txt", io.BytesIO(body), len(body), "alice")
+        transfer = self.service.upload_outbound("handoff.txt", io.BytesIO(body), len(body), "alice")
         path = Path(transfer["storage_path"]); path.write_bytes(b"evil handoff")
         with self.assertRaisesRegex(ServiceError, "integrity"):
-            self.service.decide_outbound("chip-a", transfer["id"], True, "ok", "approver")
+            self.service.decide_outbound(transfer["id"], True, "ok", "approver")
         self.assertEqual("expired", self.service.get_outbound(transfer["id"])["state"])
 
     def test_startup_permission_hardening_reseals_verified_legacy_payload(self):
@@ -524,7 +524,7 @@ class ServiceTest(unittest.TestCase):
     def test_restart_requeues_pending_and_quarantines_interrupted_scan(self):
         queue = HoldingQueue()
         service = SFSSService(self.settings, self.store, [MockScanner()], queue)
-        pending = service.upload("chip-a", "pending.txt", io.BytesIO(b"pending"), 7, "alice")
+        pending = service.upload("pending.txt", io.BytesIO(b"pending"), 7, "alice")
         self.assertEqual("pending_scan", pending["state"])
         self.store.execute("UPDATE objects SET state='scanning' WHERE id=?", (pending["id"],))
 
@@ -534,7 +534,7 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(1, stats["interrupted_quarantined"])
         self.assertEqual(0, stats["inbound_requeued"])
 
-        another = service.upload("chip-a", "queued.txt", io.BytesIO(b"queued"), 6, "alice")
+        another = service.upload("queued.txt", io.BytesIO(b"queued"), 6, "alice")
         queued_before = len(queue.jobs)
         stats = service.recover_interrupted_jobs()
         self.assertEqual(1, stats["inbound_requeued"])
@@ -546,7 +546,7 @@ class ServiceTest(unittest.TestCase):
         service = SFSSService(self.settings, self.store, [MockScanner()], HoldingQueue())
         body = b"classified crash"
         transfer = service.upload_outbound(
-            "chip-a", "crash.txt", io.BytesIO(body), len(body), "alice")
+            "crash.txt", io.BytesIO(body), len(body), "alice")
         service.outbound_transition(transfer["id"], "scanning")
         service.outbound_transition(transfer["id"], "classified", classification="GENERAL")
         stats = service.recover_interrupted_jobs()
@@ -556,7 +556,7 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(1, stats["interrupted_quarantined"])
 
         second = service.upload_outbound(
-            "chip-a", "stale.txt", io.BytesIO(body), len(body), "alice")
+            "stale.txt", io.BytesIO(body), len(body), "alice")
         service.outbound_transition(second["id"], "scanning")
         service.outbound_transition(second["id"], "classified", classification="GENERAL")
         self.store.execute("UPDATE outbound_transfers SET updated_at=? WHERE id=?",
@@ -568,7 +568,7 @@ class ServiceTest(unittest.TestCase):
     def test_multipart_completion_recovers_both_database_filesystem_crash_windows(self):
         service = SFSSService(self.settings, self.store, [MockScanner()], HoldingQueue())
         session = service.create_upload_session(
-            "chip-a", "inbound", "recover.txt", 7, "alice",
+            "inbound", "recover.txt", 7, "alice",
             hashlib.sha256(b"recover").hexdigest())
         service.put_upload_part(session["id"], 1, io.BytesIO(b"recover"), 7,
                                 hashlib.sha256(b"recover").hexdigest(), "alice")
@@ -584,7 +584,7 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(interrupted["object_id"], completed["id"])
         self.assertEqual(1, self.store.one("SELECT COUNT(*) AS value FROM objects WHERE filename='recover.txt'")["value"])
 
-        second = service.create_upload_session("chip-a", "inbound", "retry.txt", 5, "alice")
+        second = service.create_upload_session("inbound", "retry.txt", 5, "alice")
         service.put_upload_part(second["id"], 1, io.BytesIO(b"retry"), 5,
                                 hashlib.sha256(b"retry").hexdigest(), "alice")
         planned = "11111111-1111-1111-1111-111111111111"
@@ -628,7 +628,7 @@ class ServiceTest(unittest.TestCase):
         unknown = self.upload("unknown.bin", b"\x00\x01\x02")
         self.assertEqual("quarantined", unknown["state"])
         self.assertEqual(0o600, Path(unknown["storage_path"]).stat().st_mode & 0o777)
-        session = self.service.create_upload_session("chip-a", "inbound", "part.txt", 4, "alice")
+        session = self.service.create_upload_session("inbound", "part.txt", 4, "alice")
         self.service.put_upload_part(session["id"], 1, io.BytesIO(b"data"), 4,
                                      hashlib.sha256(b"data").hexdigest(), "alice")
         part = self.store.one("SELECT storage_path FROM upload_parts WHERE upload_id=?", (session["id"],))
@@ -781,19 +781,17 @@ class ServiceTest(unittest.TestCase):
             settings.validate()
 
     def test_production_startup_rejects_persisted_enabled_local_approval(self):
-        self.store.execute("DELETE FROM memberships WHERE role!='admin'")
         self.store.execute(
-            "INSERT INTO outbound_policies(project_id,enabled,approval_provider,updated_at,updated_by) "
-            "VALUES('chip-a',1,'local',1,'admin')")
+            "INSERT INTO outbound_policy(id,enabled,approval_provider,updated_at,updated_by) "
+            "VALUES(1,1,'local',1,'admin')")
         with self.assertRaisesRegex(ValueError, "persisted production policy"):
             with patch("sfss.config.platform.python_version", return_value="3.12.12"):
                 create_runtime(self.secure_production_settings("outbound"))
 
     def test_startup_rejects_enabled_wecom_policy_without_safe_relay(self):
-        self.store.execute("DELETE FROM memberships WHERE role!='admin'")
         self.store.execute(
-            "INSERT INTO outbound_policies(project_id,enabled,approval_provider,updated_at,updated_by) "
-            "VALUES('chip-a',1,'wecom',1,'admin')")
+            "INSERT INTO outbound_policy(id,enabled,approval_provider,updated_at,updated_by) "
+            "VALUES(1,1,'wecom',1,'admin')")
         with self.assertRaisesRegex(ValueError, "unsafe persisted approval relay configuration"):
             with patch("sfss.config.platform.python_version", return_value="3.12.12"):
                 create_runtime(self.secure_production_settings("outbound"))
@@ -813,17 +811,16 @@ class ServiceTest(unittest.TestCase):
     def test_production_startup_rejects_persisted_overlong_service_token(self):
         self.store.execute(
             "INSERT INTO users(username,global_admin,principal_type,enabled) VALUES('legacy-agent',0,'service',1)")
-        self.service.add_member("chip-a", "legacy-agent", "uploader", "admin")
         now = int(__import__("time").time())
         ServiceTokens(self.store).issue(
-            label="unsafe legacy lifetime", username="legacy-agent", project_id="chip-a", zone="green",
+            label="unsafe legacy lifetime", username="legacy-agent", zone="green",
             permissions=["inbound_upload"], expires_at=now + 31 * 24 * 3600, created_by="admin")
         with self.assertRaisesRegex(ValueError, "service token lifetime exceeds policy"):
             with patch("sfss.config.platform.python_version", return_value="3.12.12"):
                 create_runtime(self.secure_production_settings())
 
     def test_maintenance_expires_incomplete_upload_session(self):
-        session = self.service.create_upload_session("chip-a", "inbound", "partial.txt", 4, "alice")
+        session = self.service.create_upload_session("inbound", "partial.txt", 4, "alice")
         self.service.put_upload_part(session["id"], 1, io.BytesIO(b"data"), 4,
                                      hashlib.sha256(b"data").hexdigest(), "alice")
         self.store.execute("UPDATE upload_sessions SET expires_at=0 WHERE id=?", (session["id"],))
@@ -836,9 +833,8 @@ class ServiceTest(unittest.TestCase):
     def test_maintenance_marks_expired_service_tokens_revoked(self):
         self.store.execute(
             "INSERT INTO users(username,principal_type,enabled) VALUES('maintenance-agent','service',1)")
-        self.service.add_member("chip-a", "maintenance-agent", "uploader", "admin")
         raw, record = ServiceTokens(self.store).issue(
-            label="maintenance", username="maintenance-agent", project_id="chip-a", zone="green",
+            label="maintenance", username="maintenance-agent", zone="green",
             permissions=["inbound_upload"], expires_at=2 ** 31, created_by="admin",
         )
         self.store.execute("UPDATE service_tokens SET expires_at=0 WHERE id=?", (record["id"],))
@@ -853,9 +849,8 @@ class ServiceTest(unittest.TestCase):
     def test_maintenance_credential_cleanup_rolls_back_when_audit_fails(self):
         self.store.execute(
             "INSERT INTO users(username,principal_type,enabled) VALUES('expiry-agent','service',1)")
-        self.service.add_member("chip-a", "expiry-agent", "uploader", "admin")
         _, record = ServiceTokens(self.store).issue(
-            label="audit failure", username="expiry-agent", project_id="chip-a", zone="green",
+            label="audit failure", username="expiry-agent", zone="green",
             permissions=["inbound_upload"], expires_at=2 ** 31, created_by="admin")
         self.store.execute("UPDATE service_tokens SET expires_at=0 WHERE id=?", (record["id"],))
         with patch.object(self.store, "_append_audit", side_effect=RuntimeError("audit unavailable")):
@@ -865,7 +860,7 @@ class ServiceTest(unittest.TestCase):
             "SELECT revoked FROM service_tokens WHERE id=?", (record["id"],))["revoked"])
 
     def test_late_part_cannot_reopen_or_dirty_a_completed_upload(self):
-        session = self.service.create_upload_session("chip-a", "inbound", "race.txt", 4, "alice")
+        session = self.service.create_upload_session("inbound", "race.txt", 4, "alice")
         digest = hashlib.sha256(b"data").hexdigest()
         self.service.put_upload_part(session["id"], 1, io.BytesIO(b"data"), 4, digest, "alice")
         started = threading.Event(); release = threading.Event(); errors = []
@@ -893,38 +888,38 @@ class ServiceTest(unittest.TestCase):
 
     def test_upload_session_concurrency_and_staging_reservations_are_bounded(self):
         self.store.set_config("max_active_uploads_per_user", "1", "admin")
-        first = self.service.create_upload_session("chip-a", "inbound", "first.txt", 2, "alice")
+        first = self.service.create_upload_session("inbound", "first.txt", 2, "alice")
         with self.assertRaisesRegex(ServiceError, "too many active"):
-            self.service.create_upload_session("chip-a", "inbound", "second.txt", 2, "alice")
+            self.service.create_upload_session("inbound", "second.txt", 2, "alice")
         self.service.cancel_upload_session(first["id"], "alice")
         self.store.set_config("max_active_uploads_per_user", "4", "admin")
-        self.store.set_config("max_staged_bytes_per_project", "3", "admin")
-        self.service.create_upload_session("chip-a", "inbound", "third.txt", 2, "alice")
+        self.store.set_config("max_staged_bytes_per_user", "3", "admin")
+        self.service.create_upload_session("inbound", "third.txt", 2, "alice")
         with self.assertRaisesRegex(ServiceError, "staging reservation"):
-            self.service.create_upload_session("chip-a", "inbound", "fourth.txt", 2, "alice")
+            self.service.create_upload_session("inbound", "fourth.txt", 2, "alice")
 
     def test_storage_safety_reserve_fails_closed_before_upload(self):
         self.store.set_config("min_free_bytes", "1000", "admin")
         constrained = SimpleNamespace(total=10_000, used=8_950, free=1_050)
         with patch("sfss.service.shutil.disk_usage", return_value=constrained):
             with self.assertRaisesRegex(ServiceError, "insufficient storage") as direct:
-                self.service.upload("chip-a", "blocked.txt", io.BytesIO(b"x" * 100), 100, "alice")
+                self.service.upload("blocked.txt", io.BytesIO(b"x" * 100), 100, "alice")
             self.assertEqual(507, direct.exception.status)
             with self.assertRaisesRegex(ServiceError, "insufficient storage") as multipart:
-                self.service.create_upload_session("chip-a", "inbound", "blocked.txt", 100, "alice")
+                self.service.create_upload_session("inbound", "blocked.txt", 100, "alice")
             self.assertEqual(507, multipart.exception.status)
         self.assertEqual(0, self.store.one("SELECT COUNT(*) AS value FROM upload_sessions")["value"])
 
-    def test_existing_upload_session_rechecks_revoked_role_and_policy(self):
-        inbound = self.service.create_upload_session("chip-a", "inbound", "revoked.txt", 4, "alice")
-        self.service.remove_member("chip-a", "alice", "uploader", "admin")
-        with self.assertRaisesRegex(ServiceError, "permission denied"):
+    def test_existing_upload_session_rechecks_disabled_account_and_policy(self):
+        inbound = self.service.create_upload_session("inbound", "revoked.txt", 4, "alice")
+        self.store.execute("UPDATE users SET enabled=0 WHERE username='alice'")
+        with self.assertRaises(ServiceError):
             self.service.get_upload_session(inbound["id"], "alice")
+        self.store.execute("UPDATE users SET enabled=1 WHERE username='alice'")
 
-        self.service.add_member("chip-a", "alice", "red_uploader", "admin")
         self.enable_outbound()
-        outbound = self.service.create_upload_session("chip-a", "outbound", "disabled.txt", 4, "alice")
-        self.service.set_outbound_policy("chip-a", {"enabled":False, "approval_provider":"local",
+        outbound = self.service.create_upload_session("outbound", "disabled.txt", 4, "alice")
+        self.service.set_outbound_policy({"enabled":False, "approval_provider":"local",
             "allowed_classifications":["GENERAL"], "approval_timeout_hours":24,
             "download_ttl_hours":24}, "admin")
         with self.assertRaisesRegex(ServiceError, "disabled"):

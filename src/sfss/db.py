@@ -81,7 +81,8 @@ class Store:
               username TEXT PRIMARY KEY, global_admin INTEGER NOT NULL DEFAULT 0,
               approver INTEGER NOT NULL DEFAULT 0,
               principal_type TEXT NOT NULL DEFAULT 'human' CHECK(principal_type IN ('human','service')),
-              enabled INTEGER NOT NULL DEFAULT 1
+              enabled INTEGER NOT NULL DEFAULT 1,
+              ldap_synced INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS objects (
               id TEXT PRIMARY KEY,
@@ -170,6 +171,13 @@ class Store:
               actor TEXT NOT NULL,
               received_at INTEGER NOT NULL,
               outcome TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ldap_sync_state (
+              id INTEGER PRIMARY KEY CHECK(id=1),
+              last_run_at INTEGER NOT NULL DEFAULT 0,
+              last_status TEXT NOT NULL DEFAULT '',
+              last_summary TEXT NOT NULL DEFAULT '',
+              bind_secret TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS outbound_policy (
               id INTEGER PRIMARY KEY CHECK(id=1),
@@ -270,6 +278,8 @@ class Store:
                 db.execute("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
             if "approver" not in user_columns:
                 db.execute("ALTER TABLE users ADD COLUMN approver INTEGER NOT NULL DEFAULT 0")
+            if "ldap_synced" not in user_columns:
+                db.execute("ALTER TABLE users ADD COLUMN ldap_synced INTEGER NOT NULL DEFAULT 0")
             session_columns = {row[1] for row in db.execute("PRAGMA table_info(auth_sessions)")}
             if "auth_backend" not in session_columns:
                 db.execute("ALTER TABLE auth_sessions ADD COLUMN auth_backend TEXT NOT NULL DEFAULT 'legacy'")

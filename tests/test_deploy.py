@@ -100,13 +100,12 @@ class DeploymentTemplateTest(unittest.TestCase):
         for config in (green, red):
             self.assertIn("/parts/[0-9]+$ { limit_except PUT", config)
             self.assertIn("/complete$ { limit_except POST", config)
-            self.assertIn("/uploads$ { limit_except POST", config)
-        self.assertIn("/objects$ { limit_except GET", green)
-        self.assertNotIn("/objects$ { limit_except GET POST", green)
-        self.assertIn("/outbound$ { limit_except GET", green)
-        self.assertIn("/objects$ { limit_except GET", red)
-        self.assertIn("/outbound$ { limit_except GET", red)
-        self.assertNotIn("/outbound$ { limit_except GET POST", red)
+            self.assertIn("^/v1/uploads$ { limit_except POST", config)
+        self.assertIn("(me|objects|outbound)$ { limit_except GET", green)
+        self.assertIn("objects/[^/]+$ { limit_except GET", green)
+        self.assertIn("(me|objects|outbound)$ { limit_except GET", red)
+        self.assertIn("outbound/[^/]+$ { limit_except GET", red)
+        self.assertIn("objects/[^/]+/download$ { limit_except GET", red)
 
     def test_approval_callback_is_only_exposed_on_management_gateway(self):
         admin = (ROOT / "deploy/nginx/admin.conf").read_text(encoding="utf-8")
@@ -191,19 +190,19 @@ class DeploymentTemplateTest(unittest.TestCase):
     def test_split_zone_gateways_expose_only_their_workflow_routes(self):
         expectations = {
             "green-inbound.conf": ("/etc/nginx/sfss-in-green-proxy.inc",
-                                   ("/v1/projects/[^/]+/uploads$", "/v1/uploads/[^/]+/complete$",
+                                   ("^/v1/uploads$ { limit_except POST", "/v1/uploads/[^/]+/complete$",
                                     "/v1/uploads/[^/]+/parts/[0-9]+$"),
-                                   ("/v1/projects/[^/]+/outbound", "/download")),
+                                   ("/v1/outbound", "download")),
             "red-inbound.conf": ("/etc/nginx/sfss-in-red-proxy.inc",
-                                 ("/v1/projects/[^/]+/objects/[^/]+/download$",),
-                                 ("/v1/projects/[^/]+/outbound", "/uploads")),
+                                 ("/v1/objects/[^/]+/download$",),
+                                 ("/v1/outbound", "^/v1/uploads$")),
             "red-outbound.conf": ("/etc/nginx/sfss-out-red-proxy.inc",
-                                  ("/v1/projects/[^/]+/uploads$", "/v1/uploads/[^/]+/parts/[0-9]+$",
-                                   "/v1/projects/[^/]+/outbound$"),
-                                  ("/v1/projects/[^/]+/objects", "decision", "/download")),
+                                  ("^/v1/uploads$ { limit_except POST", "/v1/uploads/[^/]+/parts/[0-9]+$",
+                                   "^/v1/(me|outbound)$"),
+                                  ("/v1/objects", "decision", "download$")),
             "green-outbound.conf": ("/etc/nginx/sfss-out-green-proxy.inc",
-                                   ("/v1/projects/[^/]+/outbound$", "/v1/projects/[^/]+/outbound/[^/]+/download$"),
-                                   ("/uploads", "/v1/projects/[^/]+/objects")),
+                                   ("^/v1/(me|outbound)$", "/v1/outbound/[^/]+/download$"),
+                                   ("/uploads", "/v1/objects")),
         }
         for name, (include, required, forbidden) in expectations.items():
             config = (ROOT / f"deploy/nginx/{name}").read_text(encoding="utf-8")

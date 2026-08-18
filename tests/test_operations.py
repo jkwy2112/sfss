@@ -21,8 +21,7 @@ class OperationsTest(unittest.TestCase):
         settings = Settings(data_dir=self.root)
         store = Store(self.root / "sfss.db"); store.ensure_user("admin", True)
         self.service = SFSSService(settings, store, [MockScanner()], InlineJobQueue())
-        self.service.create_project("p1", "P1", "admin")
-        self.service.upload("p1", "safe.txt", io.BytesIO(b"safe backup payload"), 19, "admin")
+        self.service.upload("safe.txt", io.BytesIO(b"safe backup payload"), 19, "admin")
 
     def tearDown(self):
         self.temp.cleanup()

@@ -20,6 +20,8 @@ import time
 from .auth import (AuthenticationError, LDAPAuthenticator, LocalAuthenticator, ServiceTokens,
                    human_session_zone, local_credentials, local_tokens, valid_username)
 from .approvals import relay_signature
+from .ldap_sync import (LdapSyncError, ldap_sync_document, run_ldap_sync,
+                        save_ldap_sync_config)
 from .config import Settings, trusted_artifact_sha256
 from .db import Store
 from .jobs import SQLiteJobQueue
@@ -531,6 +533,13 @@ def make_handler(service: SFSSService, authenticator):
             if self.zone() != identity.zone:
                 raise ServiceError(403, "service token is bound to a different zone")
             if method == "GET" and path in (["v1", "me"], ["v1", "objects"], ["v1", "outbound"]): return
+            if path == ["v1", "objects"] and method == "POST":
+                self.require_service_permission(identity, "inbound_upload"); return
+            if path == ["v1", "outbound"] and method == "POST":
+                self.require_service_permission(identity, "outbound_upload"); return
+            if path == ["v1", "uploads"]:
+                # Direction/zone consistency is re-checked when the session body is read.
+                return
             if path[:2] == ["v1", "uploads"] and len(path) >= 3:
                 session = service.store.one("SELECT actor,direction FROM upload_sessions WHERE id=?", (path[2],))
                 if not session: raise ServiceError(404, "upload session not found")
@@ -1338,6 +1347,30 @@ def make_handler(service: SFSSService, authenticator):
                 policy["inbound_upload_cidrs"] = json.loads(policy["inbound_upload_cidrs"])
                 policy["outbound_upload_cidrs"] = json.loads(policy["outbound_upload_cidrs"])
                 return self.respond(200, policy)
+
+            if method == "GET" and path == ["v1", "admin", "ldap-sync"]:
+                if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
+                document = ldap_sync_document(service.store, service.settings)
+                self.audit(actor, "admin.ldap_sync.read", "success")
+                return self.respond(200, document)
+
+            if method == "PUT" and path == ["v1", "admin", "ldap-sync"]:
+                if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
+                try:
+                    document = save_ldap_sync_config(
+                        service.store, service.settings, self.read_json(), actor,
+                        audit=self.audit_payload(actor, "admin.ldap_sync.config", "success"))
+                except LdapSyncError as exc:
+                    raise ServiceError(400, str(exc)) from exc
+                return self.respond(200, document)
+
+            if method == "POST" and path == ["v1", "admin", "ldap-sync", "run"]:
+                if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")
+                try:
+                    summary = run_ldap_sync(service.store, service.settings, actor=actor)
+                except LdapSyncError as exc:
+                    raise ServiceError(400, str(exc)) from exc
+                return self.respond(200, summary)
 
             if method == "GET" and path == ["v1", "admin", "audit"]:
                 if not service.store.is_global_admin(actor): raise ServiceError(403, "platform administrator required")

@@ -72,20 +72,14 @@ class HttpTest(unittest.TestCase):
         store.ensure_user("alice")
         store.ensure_user("charlie")
         store.ensure_user("reader")
+        store.ensure_user("approver")
+        store.execute("UPDATE users SET approver=1 WHERE username='approver'")
         service = SFSSService(settings, store, [MockScanner()], InlineJobQueue())
-        service.create_project("p1", "P1", "admin")
-        service.add_member("p1", "alice", "uploader", "admin")
-        service.add_member("p1", "charlie", "uploader", "admin")
-        service.add_member("p1", "reader", "downloader", "admin")
-        service.add_member("p1", "alice", "red_uploader", "admin")
-        service.add_member("p1", "admin", "approver", "admin")
-        service.add_member("p1", "reader", "green_downloader", "admin")
-        service.set_outbound_policy("p1", {"enabled": True, "approval_provider": "local",
-            "allowed_classifications": ["GENERAL"], "approval_timeout_hours": 24, "download_ttl_hours": 24}, "admin")
+        service.set_outbound_policy({"enabled": True, "approval_provider": "local",
+                                     "allowed_classifications": ["GENERAL"],
+                                     "approval_timeout_hours": 24, "download_ttl_hours": 24}, "admin")
         service.run_maintenance()
-        store.ensure_user("outbound-only")
-        service.add_member("p1", "outbound-only", "red_uploader", "admin")
-        auth = LocalAuthenticator({"a": "alice", "c": "charlie", "r": "reader", "o": "outbound-only"}, {"admin": "admin123"}, store)
+        auth = LocalAuthenticator({"a": "alice", "c": "charlie", "r": "reader", "p": "approver"}, {"admin": "admin123"}, store)
         self.auth = auth
         self.handler_type = make_handler(service, auth)
         self.service = service
@@ -115,15 +109,15 @@ class HttpTest(unittest.TestCase):
 
     def test_green_upload_then_red_download(self):
         body = b"design handoff"
-        status, headers, payload = self.request("POST", "/v1/projects/p1/objects", body, {
+        status, headers, payload = self.request("POST", "/v1/objects", body, {
             "Authorization": "Bearer a", "X-SFSS-Zone": "green", "X-Filename": "design.txt",
             "Content-Length": str(len(body)),
         })
         self.assertEqual(202, status)
         obj = json.loads(payload)
         self.assertEqual("released", obj["state"])
-        status, _, downloaded = self.request("GET", f"/v1/projects/p1/objects/{obj['id']}/download", headers={
-            "Authorization": "Bearer r", "X-SFSS-Zone": "red",
+        status, _, downloaded = self.request("GET", f"/v1/objects/{obj['id']}/download", headers={
+            "Authorization": "Bearer a", "X-SFSS-Zone": "red",
         })
         self.assertEqual(200, status)
         self.assertEqual(body, downloaded)
@@ -138,19 +132,26 @@ class HttpTest(unittest.TestCase):
             "SELECT action,outcome FROM audit_events ORDER BY id DESC LIMIT 1")
         self.assertEqual(("request.timeout", "error"), (event["action"], event["outcome"]))
 
-    def test_zone_metadata_visibility_matches_portal_lists(self):
-        released = self.service.upload("p1", "owned.txt", io.BytesIO(b"owned safe text"), 15, "alice")
-        quarantined = self.service.upload("p1", "unknown.bin", io.BytesIO(b"\x00\x01\x02\x03"), 4, "alice")
-        status, _, _ = self.request("GET", f"/v1/projects/p1/objects/{released['id']}", headers={
+    def test_zone_metadata_visibility_is_owner_only(self):
+        released = self.service.upload("owned.txt", io.BytesIO(b"owned safe text"), 15, "alice")
+        quarantined = self.service.upload("unknown.bin", io.BytesIO(b"\x00\x01\x02\x03"), 4, "alice")
+        status, _, _ = self.request("GET", f"/v1/objects/{released['id']}", headers={
             "Authorization":"Bearer c", "X-SFSS-Zone":"green"})
         self.assertEqual(404, status)
-        status, _, _ = self.request("GET", f"/v1/projects/p1/objects/{quarantined['id']}", headers={
+        status, _, _ = self.request("GET", f"/v1/objects/{quarantined['id']}", headers={
             "Authorization":"Bearer r", "X-SFSS-Zone":"red"})
         self.assertEqual(404, status)
-        status, _, payload = self.request("GET", f"/v1/projects/p1/objects/{released['id']}", headers={
+        status, _, _ = self.request("GET", f"/v1/objects/{released['id']}", headers={
             "Authorization":"Bearer r", "X-SFSS-Zone":"red"})
+        self.assertEqual(404, status)  # only the uploader may see their own object
+        status, _, payload = self.request("GET", f"/v1/objects/{released['id']}", headers={
+            "Authorization":"Bearer a", "X-SFSS-Zone":"red"})
         self.assertEqual(200, status)
         self.assertEqual(released["id"], json.loads(payload)["id"])
+        status, _, payload = self.request("GET", "/v1/objects", headers={
+            "Authorization":"Bearer a", "X-SFSS-Zone":"red"})
+        self.assertEqual(["owned.txt"],
+                         [item["filename"] for item in json.loads(payload)["objects"]])
 
     def test_production_rejects_legacy_direct_upload_routes(self):
         original = self.service.settings
@@ -161,8 +162,8 @@ class HttpTest(unittest.TestCase):
         self.service.settings = replace(candidate, expected_config_sha256=candidate.configuration_fingerprint(
             self.service.store.all("SELECT key,value FROM system_config ORDER BY key")))
         try:
-            for path, zone in (("/v1/projects/p1/objects", "green"),
-                               ("/v1/projects/p1/outbound", "red")):
+            for path, zone in (("/v1/objects", "green"),
+                               ("/v1/outbound", "red")):
                 status, _, payload = self.request("POST", path, b"data", {
                     "Authorization":"Bearer a", "X-SFSS-Zone":zone,
                     "X-Filename":"direct.txt", "Content-Length":"4",
@@ -177,7 +178,7 @@ class HttpTest(unittest.TestCase):
         whole_hash = hashlib.sha256(body).hexdigest()
         create = json.dumps({"direction":"inbound","filename":"large.txt","total_size":len(body),
                              "expected_sha256":whole_hash}).encode()
-        status, _, payload = self.request("POST", "/v1/projects/p1/uploads", create, {
+        status, _, payload = self.request("POST", "/v1/uploads", create, {
             "Authorization":"Bearer a","X-SFSS-Zone":"green","Content-Type":"application/json",
             "Content-Length":str(len(create)),
         })
@@ -196,8 +197,8 @@ class HttpTest(unittest.TestCase):
             "Authorization":"Bearer a","X-SFSS-Zone":"green",
         })
         self.assertEqual(202, status); obj = json.loads(payload); self.assertEqual("released", obj["state"])
-        status, headers, downloaded = self.request("GET", f"/v1/projects/p1/objects/{obj['id']}/download", headers={
-            "Authorization":"Bearer r","X-SFSS-Zone":"red","Range":"bytes=1048576-",
+        status, headers, downloaded = self.request("GET", f"/v1/objects/{obj['id']}/download", headers={
+            "Authorization":"Bearer a","X-SFSS-Zone":"red","Range":"bytes=1048576-",
             "If-Range":f'"{whole_hash}"',
         })
         self.assertEqual(206, status); self.assertEqual(second, downloaded)
@@ -206,7 +207,7 @@ class HttpTest(unittest.TestCase):
 
     def test_bad_part_hash_is_rejected_without_progress(self):
         create = json.dumps({"direction":"inbound","filename":"bad.txt","total_size":4}).encode()
-        status, _, payload = self.request("POST", "/v1/projects/p1/uploads", create, {
+        status, _, payload = self.request("POST", "/v1/uploads", create, {
             "Authorization":"Bearer a","X-SFSS-Zone":"green","Content-Type":"application/json",
             "Content-Length":str(len(create)),
         })
@@ -221,7 +222,7 @@ class HttpTest(unittest.TestCase):
     def test_outbound_multipart_enters_approval_pipeline(self):
         body = b"red multipart handoff"
         create = json.dumps({"direction":"outbound","filename":"handoff.txt","total_size":len(body)}).encode()
-        status, _, payload = self.request("POST", "/v1/projects/p1/uploads", create, {
+        status, _, payload = self.request("POST", "/v1/uploads", create, {
             "Authorization":"Bearer a","X-SFSS-Zone":"red","Content-Type":"application/json",
             "Content-Length":str(len(create)),
         })
@@ -238,7 +239,7 @@ class HttpTest(unittest.TestCase):
 
     def test_upload_session_can_be_cancelled(self):
         create = json.dumps({"direction":"inbound","filename":"cancel.txt","total_size":4}).encode()
-        status, _, payload = self.request("POST", "/v1/projects/p1/uploads", create, {
+        status, _, payload = self.request("POST", "/v1/uploads", create, {
             "Authorization":"Bearer a","X-SFSS-Zone":"green","Content-Type":"application/json",
             "Content-Length":str(len(create)),
         })
@@ -265,37 +266,37 @@ class HttpTest(unittest.TestCase):
 
     def test_range_request_rejects_invalid_offset(self):
         body = b"range content"
-        status, _, payload = self.request("POST", "/v1/projects/p1/objects", body, {
+        status, _, payload = self.request("POST", "/v1/objects", body, {
             "Authorization":"Bearer a","X-SFSS-Zone":"green","X-Filename":"range.txt","Content-Length":str(len(body)),
         })
         obj = json.loads(payload)
-        status, headers, _ = self.request("GET", f"/v1/projects/p1/objects/{obj['id']}/download", headers={
-            "Authorization":"Bearer r","X-SFSS-Zone":"red","Range":"bytes=999-1000",
+        status, headers, _ = self.request("GET", f"/v1/objects/{obj['id']}/download", headers={
+            "Authorization":"Bearer a","X-SFSS-Zone":"red","Range":"bytes=999-1000",
         })
         self.assertEqual(416, status); self.assertEqual(f"bytes */{len(body)}", headers["Content-Range"])
 
     def test_download_manifest_is_signed_when_key_is_configured(self):
-        obj = self.service.upload("p1", "signed.txt", io.BytesIO(b"signed payload"), 14, "alice")
+        obj = self.service.upload("signed.txt", io.BytesIO(b"signed payload"), 14, "alice")
         settings = replace(self.service.settings, manifest_hmac_key="k" * 32)
         service = SFSSService(settings, self.service.store, [MockScanner()], InlineJobQueue())
         original = self.handler_type; self.handler_type = make_handler(service, self.auth)
         try:
-            status, headers, _ = self.request("GET", f"/v1/projects/p1/objects/{obj['id']}/download", headers={
-                "Authorization":"Bearer r","X-SFSS-Zone":"red",
+            status, headers, _ = self.request("GET", f"/v1/objects/{obj['id']}/download", headers={
+                "Authorization":"Bearer a","X-SFSS-Zone":"red",
             })
         finally:
             self.handler_type = original
-        manifest = f'{obj["id"]}\np1\n14\n{obj["sha256"]}'
+        manifest = f'{obj["id"]}\n14\n{obj["sha256"]}'
         expected = hmac.new(("k" * 32).encode(), manifest.encode(), hashlib.sha256).hexdigest()
         self.assertEqual(200, status); self.assertEqual(expected, headers["X-SFSS-Manifest-Signature"])
 
     def test_wrong_zone_and_missing_auth_are_denied(self):
-        status, _, _ = self.request("POST", "/v1/projects/p1/objects", b"x", {
+        status, _, _ = self.request("POST", "/v1/objects", b"x", {
             "Authorization": "Bearer a", "X-SFSS-Zone": "red", "X-Filename": "x.txt",
             "Content-Length": "1",
         })
         self.assertEqual(403, status)
-        status, _, _ = self.request("GET", "/v1/projects/p1/audit")
+        status, _, _ = self.request("GET", "/v1/admin/audit")
         self.assertEqual(401, status)
 
     def test_trusted_gateway_boundary_and_forwarded_client_ip(self):
@@ -306,18 +307,18 @@ class HttpTest(unittest.TestCase):
         handler_type = make_handler(service, self.auth)
         original = self.handler_type; self.handler_type = handler_type
         try:
-            status, _, _ = self.request("GET", "/v1/projects", headers={"Authorization":"Bearer a","X-SFSS-Zone":"green"})
+            status, _, _ = self.request("GET", "/v1/objects", headers={"Authorization":"Bearer a","X-SFSS-Zone":"green"})
             self.assertEqual(403, status)
-            status, _, _ = self.request("GET", "/v1/projects", headers={
+            status, _, _ = self.request("GET", "/v1/objects", headers={
                 "Authorization":"Bearer a","X-SFSS-Zone":"green","X-Forwarded-Proto":"https",
                 "X-Forwarded-For":"127.0.0.1","X-SFSS-Gateway-Role":"green",
             }, client_address="10.30.0.9")
             self.assertEqual(200, status)
-            create = json.dumps({"id":"forbidden","name":"Forbidden"}).encode()
-            status, _, _ = self.request("POST", "/v1/projects", create, headers={
+            policy = json.dumps({"inbound_upload_cidrs":["10.0.0.0/8"]}).encode()
+            status, _, _ = self.request("PUT", "/v1/admin/network-policy", policy, headers={
                 "Authorization":"Bearer admin","X-SFSS-Zone":"green","X-Forwarded-Proto":"https",
                 "X-Forwarded-For":"127.0.0.1","X-SFSS-Gateway-Role":"green",
-                "Content-Type":"application/json","Content-Length":str(len(create)),
+                "Content-Type":"application/json","Content-Length":str(len(policy)),
             }, client_address="10.30.0.9")
             self.assertEqual(403, status)
             callback = b"{}"
@@ -352,9 +353,10 @@ class HttpTest(unittest.TestCase):
         })
         self.assertEqual(200, status)
         token = json.loads(payload)["token"]
-        status, _, payload = self.request("GET", "/v1/projects", headers={"Authorization": f"Bearer {token}"})
+        status, _, payload = self.request("GET", "/v1/me", headers={"Authorization": f"Bearer {token}"})
         self.assertEqual(200, status)
-        self.assertEqual("p1", json.loads(payload)["projects"][0]["id"])
+        self.assertEqual("admin", json.loads(payload)["username"])
+        self.assertTrue(json.loads(payload)["global_admin"])
 
     def test_login_session_cannot_be_replayed_between_green_and_red(self):
         body = json.dumps({"username": "admin", "password": "admin123"}).encode()
@@ -365,11 +367,11 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(200, status)
         login = json.loads(payload); self.assertEqual("green", login["session_zone"])
         headers = {"Authorization":f"Bearer {login['token']}", "X-SFSS-Zone":"green"}
-        self.assertEqual(200, self.request("GET", "/v1/projects", headers=headers)[0])
+        self.assertEqual(200, self.request("GET", "/v1/objects", headers=headers)[0])
         headers["X-SFSS-Zone"] = "red"
-        self.assertEqual(401, self.request("GET", "/v1/projects", headers=headers)[0])
+        self.assertEqual(401, self.request("GET", "/v1/objects", headers=headers)[0])
         headers["X-SFSS-Zone"] = "green"
-        self.assertEqual(200, self.request("GET", "/v1/projects", headers=headers)[0])
+        self.assertEqual(200, self.request("GET", "/v1/objects", headers=headers)[0])
 
     def test_bad_local_password_is_rejected(self):
         body = json.dumps({"username": "admin", "password": "wrong"}).encode()
@@ -387,7 +389,7 @@ class HttpTest(unittest.TestCase):
         status, _, payload = self.request("GET", "/v1/admin/overview", headers={"Authorization": f"Bearer {token}"})
         self.assertEqual(200, status)
         overview = json.loads(payload)
-        self.assertEqual(1, overview["counts"]["projects"])
+        self.assertGreaterEqual(overview["counts"]["users"], 3)
         status, _, _ = self.request("GET", "/v1/admin/overview", headers={"Authorization": "Bearer a"})
         self.assertEqual(403, status)
         status, _, _ = self.request("GET", "/v1/admin/sessions", headers={"Authorization": "Bearer a"})
@@ -403,7 +405,7 @@ class HttpTest(unittest.TestCase):
 
     def test_admin_can_persist_policy_and_manage_local_user(self):
         token = self.admin_token()
-        status, _, payload = self.request("GET", "/v1/projects/p1/outbound-policy", headers={
+        status, _, payload = self.request("GET", "/v1/admin/outbound-policy", headers={
             "Authorization":f"Bearer {token}"})
         self.assertEqual(200, status)
         self.assertTrue(json.loads(payload)["local_approval_allowed"])
@@ -487,18 +489,15 @@ class HttpTest(unittest.TestCase):
             "SELECT action,outcome FROM audit_events WHERE action='admin.session.revoke_all' ORDER BY id DESC LIMIT 1")
         self.assertEqual({"action":"admin.session.revoke_all", "outcome":"success"}, event)
 
-    def test_project_zone_scoped_service_token_cannot_escape_scope(self):
+    def test_zone_scoped_service_token_cannot_escape_scope(self):
         admin = self.admin_token()
-        self.service.create_project("p2", "P2", "admin")
         identity_body = json.dumps({"username":"green-agent"}).encode()
         status, _, _ = self.request("POST", "/v1/admin/service-identities", identity_body, {
             "Authorization":f"Bearer {admin}", "Content-Type":"application/json",
             "Content-Length":str(len(identity_body)),
         })
         self.assertEqual(201, status)
-        self.service.add_member("p1", "green-agent", "uploader", "admin")
-        self.service.add_member("p2", "green-agent", "uploader", "admin")
-        excessive = json.dumps({"label":"too long", "username":"green-agent", "project_id":"p1",
+        excessive = json.dumps({"label":"too long", "username":"green-agent",
                                 "zone":"green", "permissions":["inbound_upload"],
                                 "expires_hours":721}).encode()
         status, _, _ = self.request("POST", "/v1/admin/service-tokens", excessive, {
@@ -506,7 +505,15 @@ class HttpTest(unittest.TestCase):
             "Content-Length":str(len(excessive)),
         })
         self.assertEqual(400, status)
-        body = json.dumps({"label":"green uploader", "username":"green-agent", "project_id":"p1",
+        cross_zone = json.dumps({"label":"cross zone", "username":"green-agent",
+                                 "zone":"green", "permissions":["outbound_upload"],
+                                 "expires_hours":24}).encode()
+        status, _, _ = self.request("POST", "/v1/admin/service-tokens", cross_zone, {
+            "Authorization":f"Bearer {admin}", "Content-Type":"application/json",
+            "Content-Length":str(len(cross_zone)),
+        })
+        self.assertEqual(400, status)
+        body = json.dumps({"label":"green uploader", "username":"green-agent",
                            "zone":"green", "permissions":["inbound_upload"], "expires_hours":24}).encode()
         status, _, payload = self.request("POST", "/v1/admin/service-tokens", body, {
             "Authorization":f"Bearer {admin}", "Content-Type":"application/json",
@@ -515,35 +522,31 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(201, status); issued = json.loads(payload); token = issued["token"]
         row = self.service.store.one("SELECT token_hash FROM service_tokens WHERE id=?", (issued["id"],))
         self.assertNotEqual(token, row["token_hash"])
-        status, _, payload = self.request("GET", "/v1/projects", headers={
-            "Authorization":f"Bearer {token}", "X-SFSS-Zone":"green"})
-        self.assertEqual(["p1"], [project["id"] for project in json.loads(payload)["projects"]])
 
         headers = {"Authorization":f"Bearer {token}", "X-SFSS-Zone":"green",
                    "X-Filename":"agent.txt", "Content-Length":"10"}
-        status, _, payload = self.request("POST", "/v1/projects/p1/objects", b"agent data", headers)
+        status, _, payload = self.request("POST", "/v1/objects", b"agent data", headers)
         self.assertEqual(202, status); object_id = json.loads(payload)["id"]
-        status, _, _ = self.request("POST", "/v1/projects/p2/objects", b"agent data", headers)
-        self.assertEqual(403, status)
-        status, _, _ = self.request("GET", f"/v1/projects/p1/objects/{object_id}/download", headers={
+        status, _, _ = self.request("GET", f"/v1/objects/{object_id}/download", headers={
             "Authorization":f"Bearer {token}", "X-SFSS-Zone":"red"})
-        self.assertEqual(403, status)
+        self.assertEqual(403, status)  # upload scope cannot download
         status, _, _ = self.request("GET", "/v1/admin/overview", headers={
             "Authorization":f"Bearer {token}", "X-SFSS-Zone":"green"})
         self.assertEqual(403, status)
-        self.service.remove_member("p1", "green-agent", "uploader", "admin")
-        status, _, _ = self.request("POST", "/v1/projects/p1/objects", b"agent data", headers)
-        self.assertEqual(401, status)  # role revocation also kills scopes derived from that role
+        self.service.store.execute("UPDATE users SET enabled=0 WHERE username='green-agent'")
+        status, _, _ = self.request("POST", "/v1/objects", b"agent data", headers)
+        self.assertEqual(401, status)  # identity disable kills every derived token
+        self.service.store.execute("UPDATE users SET enabled=1 WHERE username='green-agent'")
         status, _, _ = self.request("DELETE", f"/v1/admin/service-tokens/{issued['id']}", headers={
             "Authorization":f"Bearer {admin}"})
         self.assertEqual(204, status)
-        status, _, _ = self.request("GET", "/v1/projects", headers={
+        status, _, _ = self.request("GET", "/v1/objects", headers={
             "Authorization":f"Bearer {token}", "X-SFSS-Zone":"green"})
         self.assertEqual(401, status)
 
     def test_service_tokens_require_non_interactive_identity_and_disable_revokes(self):
         admin = self.admin_token()
-        human_body = json.dumps({"label":"invalid", "username":"alice", "project_id":"p1",
+        human_body = json.dumps({"label":"invalid", "username":"alice",
                                  "zone":"green", "permissions":["inbound_upload"],
                                  "expires_hours":24}).encode()
         status, _, _ = self.request("POST", "/v1/admin/service-tokens", human_body, {
@@ -558,8 +561,7 @@ class HttpTest(unittest.TestCase):
             "Content-Length":str(len(identity_body)),
         })
         self.assertEqual(201, status)
-        self.service.add_member("p1", "disabled-agent", "uploader", "admin")
-        issue_body = json.dumps({"label":"disable test", "username":"disabled-agent", "project_id":"p1",
+        issue_body = json.dumps({"label":"disable test", "username":"disabled-agent",
                                  "zone":"green", "permissions":["inbound_upload"],
                                  "expires_hours":24}).encode()
         status, _, payload = self.request("POST", "/v1/admin/service-tokens", issue_body, {
@@ -579,53 +581,38 @@ class HttpTest(unittest.TestCase):
             "Content-Length":str(len(disable_body)),
         })
         self.assertEqual(200, status)
-        status, _, _ = self.request("GET", "/v1/projects", headers={
+        status, _, _ = self.request("GET", "/v1/objects", headers={
             "Authorization":f"Bearer {service_token}", "X-SFSS-Zone":"green"})
         self.assertEqual(401, status)
-
-    def test_admin_can_rename_and_archive_project(self):
-        token = self.admin_token()
-        body = json.dumps({"name": "Renamed"}).encode()
-        status, _, _ = self.request("PUT", "/v1/admin/projects/p1", body, {
-            "Authorization": f"Bearer {token}", "Content-Type": "application/json", "Content-Length": str(len(body)),
-        })
-        self.assertEqual(200, status)
-        status, _, _ = self.request("DELETE", "/v1/admin/projects/p1", headers={"Authorization": f"Bearer {token}"})
-        self.assertEqual(204, status)
-        status, _, payload = self.request("GET", "/v1/projects", headers={"Authorization": f"Bearer {token}"})
-        self.assertEqual([], json.loads(payload)["projects"])
-        status, _, _ = self.request("POST", "/v1/admin/projects/p1/restore", b"{}", {
-            "Authorization":f"Bearer {token}","Content-Type":"application/json","Content-Length":"2"})
-        self.assertEqual(200, status)
-        status, _, payload = self.request("GET", "/v1/projects", headers={"Authorization": f"Bearer {token}"})
-        self.assertEqual("p1", json.loads(payload)["projects"][0]["id"])
 
     def test_red_upload_requires_red_zone_and_green_download_requires_green_zone(self):
         body = b"outbound general text"
         headers = {"Authorization": "Bearer a", "X-SFSS-Zone": "green", "X-Filename": "out.txt", "Content-Length": str(len(body))}
-        status, _, _ = self.request("POST", "/v1/projects/p1/outbound", body, headers)
+        status, _, _ = self.request("POST", "/v1/outbound", body, headers)
         self.assertEqual(403, status)
         headers["X-SFSS-Zone"] = "red"
-        status, _, payload = self.request("POST", "/v1/projects/p1/outbound", body, headers)
+        status, _, payload = self.request("POST", "/v1/outbound", body, headers)
         self.assertEqual(202, status); transfer = json.loads(payload)
-        token = self.admin_token(); decision = json.dumps({"approved": True, "comment": "ok"}).encode()
-        status, _, payload = self.request("POST", f"/v1/projects/p1/outbound/{transfer['id']}/decision", decision, {
-            "Authorization": f"Bearer {token}", "Content-Type": "application/json", "Content-Length": str(len(decision)),
+        decision = json.dumps({"approved": True, "comment": "ok"}).encode()
+        status, _, _ = self.request("POST", f"/v1/outbound/{transfer['id']}/decision", decision, {
+            "Authorization": "Bearer p", "Content-Type": "application/json", "Content-Length": str(len(decision)),
         })
         self.assertEqual(200, status)
-        status, _, _ = self.request("GET", f"/v1/projects/p1/outbound/{transfer['id']}/download", headers={"Authorization":"Bearer r","X-SFSS-Zone":"red"})
+        status, _, _ = self.request("GET", f"/v1/outbound/{transfer['id']}/download", headers={"Authorization":"Bearer a","X-SFSS-Zone":"red"})
         self.assertEqual(403, status)
-        status, _, downloaded = self.request("GET", f"/v1/projects/p1/outbound/{transfer['id']}/download", headers={"Authorization":"Bearer r","X-SFSS-Zone":"green"})
+        status, _, _ = self.request("GET", f"/v1/outbound/{transfer['id']}/download", headers={"Authorization":"Bearer r","X-SFSS-Zone":"green"})
+        self.assertEqual(404, status)  # only the submitting user may download their own release
+        status, _, downloaded = self.request("GET", f"/v1/outbound/{transfer['id']}/download", headers={"Authorization":"Bearer a","X-SFSS-Zone":"green"})
         self.assertEqual(200, status); self.assertEqual(body, downloaded)
 
     def test_signed_enterprise_approval_callback_is_idempotent_and_replay_safe(self):
         body = b"enterprise approval payload"
-        transfer = self.service.upload_outbound("p1", "approval.txt", io.BytesIO(body), len(body), "alice")
+        transfer = self.service.upload_outbound("approval.txt", io.BytesIO(body), len(body), "alice")
         self.service.store.execute(
             "UPDATE outbound_transfers SET approval_provider='wecom',approval_id='relay-approval-1' WHERE id=?",
             (transfer["id"],))
         self.service.store.execute(
-            "UPDATE outbound_policies SET approval_provider='wecom' WHERE project_id='p1'")
+            "UPDATE outbound_policy SET approval_provider='wecom' WHERE id=1")
         callback_key = "callback-secret-" + "x" * 32
         self.service.settings = replace(self.service.settings, approval_relay_callback_hmac_key=callback_key)
         self.handler_type = make_handler(self.service, self.auth)
@@ -669,15 +656,15 @@ class HttpTest(unittest.TestCase):
     def test_project_ip_allowlists_block_uploads_before_content_processing(self):
         token = self.admin_token()
         policy = json.dumps({"inbound_upload_cidrs": ["10.10.0.0/16"], "outbound_upload_cidrs": ["10.20.0.0/16"]}).encode()
-        status, _, _ = self.request("PUT", "/v1/projects/p1/network-policy", policy, {
+        status, _, _ = self.request("PUT", "/v1/admin/network-policy", policy, {
             "Authorization": f"Bearer {token}", "Content-Type": "application/json", "Content-Length": str(len(policy)),
         })
         self.assertEqual(200, status)
         body = b"blocked"
-        status, _, _ = self.request("POST", "/v1/projects/p1/objects", body, {
+        status, _, _ = self.request("POST", "/v1/objects", body, {
             "Authorization":"Bearer a","X-SFSS-Zone":"green","X-Filename":"a.txt","Content-Length":str(len(body))})
         self.assertEqual(403, status)
-        status, _, _ = self.request("POST", "/v1/projects/p1/outbound", body, {
+        status, _, _ = self.request("POST", "/v1/outbound", body, {
             "Authorization":"Bearer a","X-SFSS-Zone":"red","X-Filename":"a.txt","Content-Length":str(len(body))})
         self.assertEqual(403, status)
         self.assertEqual(0, len(self.service.store.all("SELECT id FROM objects")))
@@ -685,14 +672,14 @@ class HttpTest(unittest.TestCase):
 
     def test_upload_completion_rechecks_changed_source_ip_policy(self):
         create = json.dumps({"direction":"inbound", "filename":"policy.txt", "total_size":4}).encode()
-        status, _, payload = self.request("POST", "/v1/projects/p1/uploads", create, {
+        status, _, payload = self.request("POST", "/v1/uploads", create, {
             "Authorization":"Bearer a", "X-SFSS-Zone":"green", "Content-Length":str(len(create))})
         self.assertEqual(201, status); upload_id = json.loads(payload)["id"]
         status, _, _ = self.request("PUT", f"/v1/uploads/{upload_id}/parts/1", b"data", {
             "Authorization":"Bearer a", "X-SFSS-Zone":"green", "Content-Length":"4",
             "X-Part-SHA256":hashlib.sha256(b"data").hexdigest()})
         self.assertEqual(200, status)
-        self.service.set_network_policy("p1", {
+        self.service.set_network_policy({
             "inbound_upload_cidrs":["10.10.0.0/16"], "outbound_upload_cidrs":["127.0.0.1/32"]}, "admin")
         status, _, _ = self.request("POST", f"/v1/uploads/{upload_id}/complete", headers={
             "Authorization":"Bearer a", "X-SFSS-Zone":"green"})
@@ -702,16 +689,29 @@ class HttpTest(unittest.TestCase):
 
     def test_invalid_network_policy_is_rejected(self):
         token = self.admin_token(); body = json.dumps({"inbound_upload_cidrs":["not-an-ip"],"outbound_upload_cidrs":["127.0.0.1"]}).encode()
-        status, _, _ = self.request("PUT", "/v1/projects/p1/network-policy", body, {
+        status, _, _ = self.request("PUT", "/v1/admin/network-policy", body, {
             "Authorization":f"Bearer {token}","Content-Type":"application/json","Content-Length":str(len(body))})
         self.assertEqual(400, status)
 
-    def test_outbound_only_member_can_discover_project(self):
-        status, _, payload = self.request("GET", "/v1/projects", headers={"Authorization":"Bearer o"})
-        self.assertEqual(200, status)
-        project = json.loads(payload)["projects"][0]
-        self.assertEqual("p1", project["id"])
-        self.assertEqual(["red_uploader"], project["outbound_roles"])
+    def test_personal_space_lists_only_own_files_and_approver_sees_all(self):
+        self.service.upload("mine.txt", io.BytesIO(b"mine"), 4, "alice")
+        self.service.upload("theirs.txt", io.BytesIO(b"theirs"), 6, "reader")
+        status, _, payload = self.request("GET", "/v1/objects", headers={
+            "Authorization":"Bearer a", "X-SFSS-Zone":"green"})
+        self.assertEqual(["mine.txt"],
+                         [item["filename"] for item in json.loads(payload)["objects"]])
+        status, _, payload = self.request("GET", "/v1/objects", headers={
+            "Authorization":"Bearer r"})
+        self.assertEqual(["theirs.txt"],
+                         [item["filename"] for item in json.loads(payload)["objects"]])
+        transfer = self.service.upload_outbound("req.txt", io.BytesIO(b"request"), 7, "reader")
+        status, _, payload = self.request("GET", "/v1/outbound", headers={
+            "Authorization":"Bearer a", "X-SFSS-Zone":"red"})
+        self.assertEqual([], json.loads(payload)["transfers"])  # alice sees only her own
+        status, _, payload = self.request("GET", "/v1/outbound", headers={
+            "Authorization":"Bearer p", "X-SFSS-Zone":"red"})
+        self.assertIn(transfer["id"],
+                      [row["id"] for row in json.loads(payload)["transfers"]])  # approver sees all
 
     def test_static_console_has_security_headers(self):
         status, headers, _ = self.request("GET", "/")
@@ -786,7 +786,7 @@ class HttpTest(unittest.TestCase):
         finally:
             self.service.security_artifact_errors = original_artifacts
         self.service.store.execute(
-            "UPDATE outbound_policies SET approval_provider='wecom',enabled=1 WHERE project_id='p1'")
+            "UPDATE outbound_policy SET approval_provider='wecom',enabled=1 WHERE id=1")
         status, _, payload = self.request("GET", "/ready")
         self.assertEqual(503, status)
         self.assertEqual("degraded", json.loads(payload)["approval_relay"]["status"])
@@ -794,7 +794,7 @@ class HttpTest(unittest.TestCase):
     def test_readiness_detects_production_secret_file_drift(self):
         secret = Path(self.temp.name) / "manifest-hmac.key"
         secret.write_text("m" * 32, encoding="utf-8"); secret.chmod(0o600)
-        released = self.service.upload("p1", "drift.txt", io.BytesIO(b"drift payload"), 13, "alice")
+        released = self.service.upload("drift.txt", io.BytesIO(b"drift payload"), 13, "alice")
         original = self.service.settings
         candidate = replace(original, environment="production", manifest_hmac_key="m" * 32,
                             manifest_hmac_key_file=str(secret), expected_config_sha256="0" * 64)
@@ -809,7 +809,7 @@ class HttpTest(unittest.TestCase):
             self.assertEqual(503, status)
             self.assertEqual("degraded", json.loads(payload)["secrets"]["status"])
             status, _, _ = self.request(
-                "GET", f"/v1/projects/p1/objects/{released['id']}/download",
+                "GET", f"/v1/objects/{released['id']}/download",
                 headers={"Authorization":"Bearer r", "X-SFSS-Zone":"red"})
             self.assertEqual(503, status)
         finally:
@@ -825,16 +825,16 @@ class HttpTest(unittest.TestCase):
         self.service.settings = replace(candidate, expected_config_sha256=candidate.configuration_fingerprint(
             self.service.store.all("SELECT key,value FROM system_config ORDER BY key")))
         try:
-            self.assertEqual(200, self.request("GET", "/v1/projects", headers={
+            self.assertEqual(200, self.request("GET", "/v1/objects", headers={
                 "Authorization":"Bearer a", "X-SFSS-Zone":"green"})[0])
             self.service.store.set_config("retention_seconds", "7200", "test-drift")
             self.assertEqual(200, self.request("GET", "/health")[0])
             status, _, payload = self.request("GET", "/ready")
             self.assertEqual(503, status)
             self.assertEqual("drifted", json.loads(payload)["configuration"]["status"])
-            self.assertEqual(503, self.request("GET", "/v1/projects", headers={
+            self.assertEqual(503, self.request("GET", "/v1/objects", headers={
                 "Authorization":"Bearer a", "X-SFSS-Zone":"green"})[0])
-            self.assertEqual(503, self.request("POST", "/v1/projects/p1/objects", b"data", {
+            self.assertEqual(503, self.request("POST", "/v1/objects", b"data", {
                 "Authorization":"Bearer a", "X-SFSS-Zone":"green", "X-Filename":"drift.txt",
                 "Content-Length":"4"})[0])
             self.assertEqual(200, self.request("GET", "/v1/admin/config", headers={
@@ -856,7 +856,7 @@ class HttpTest(unittest.TestCase):
         try:
             config = json.dumps({"retention_hours":24, "max_upload_mb":8, "multipart_chunk_mb":32,
                                  "upload_session_hours":24, "max_active_uploads_per_user":4,
-                                 "max_staged_gb_per_project":4, "min_free_gb":1,
+                                 "max_staged_gb_per_user":4, "min_free_gb":1,
                                  "scanners":"clamav", "clamav_host":"127.0.0.1",
                                  "clamav_port":3310, "yara_rules":""}).encode()
             with patch("sfss.server.build_scanners", return_value=[MockScanner()]):
@@ -869,7 +869,7 @@ class HttpTest(unittest.TestCase):
             self.assertFalse(result["configuration_accepted"])
             self.assertTrue(result["restart_required"])
             self.assertEqual(64, len(result["observed_sha256"]))
-            self.assertEqual(503, self.request("GET", "/v1/projects", headers={
+            self.assertEqual(503, self.request("GET", "/v1/objects", headers={
                 "Authorization":"Bearer a", "X-SFSS-Zone":"green"})[0])
         finally:
             self.service.settings = original
