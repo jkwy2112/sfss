@@ -14,7 +14,7 @@
         <div class="brand-mark">SF</div>
         <p class="eyebrow">SECURE FILE SHUTTLE SYSTEM</p>
         <h1>文件过界，<br>安全先行。</h1>
-        <p class="subtle">绿区上传、隔离扫描、红区受控下载。所有未知和异常默认隔离。</p>
+        <p class="subtle">绿区上传、隔离扫描、红区受控下载。所有未知和异常默认隔离。每个用户只能看到自己上传的文件。</p>
       </div>
       <form id="login-form" class="card login-card">
         <p class="eyebrow">本地测试模式</p>
@@ -34,100 +34,79 @@
       </header>
       <div class="workspace">
         <aside>
-          <p class="eyebrow">项目空间</p>
-          <div id="project-list" class="project-list"></div>
-          <button id="new-project" class="secondary full">＋ 新建项目</button>
+          <p class="eyebrow">个人空间</p>
+          <div class="project-list">
+            <button class="project-item active" id="space-card" type="button"></button>
+          </div>
           <button id="admin-console" class="admin-link full" hidden>⚙ 管理员后台</button>
+          <button id="back-to-files" class="admin-link full" hidden>← 返回个人空间</button>
           <div class="health"><span class="dot"></span><span>服务运行正常</span><small id="scanner-state"></small></div>
         </aside>
         <section class="content">
-          <div id="empty-state" class="empty card">
-            <h2>选择或创建项目</h2><p>文件权限、扫描状态和审计记录均按项目隔离。</p>
-          </div>
-          <div id="project-view" hidden>
+          <div id="main-view">
             <div class="title-row">
-              <div><p class="eyebrow">当前项目</p><h1 id="project-title"></h1><p id="project-meta" class="subtle"></p></div>
+              <div><p class="eyebrow">PERSONAL WORKSPACE</p><h1 id="space-title">我的文件</h1><p id="space-meta" class="subtle"></p></div>
               <button id="refresh" class="secondary">刷新状态</button>
             </div>
             <nav class="tabs">
               <button id="files-tab-button" class="tab active" data-tab="files">文件摆渡</button>
               <button id="outbound-tab-button" class="tab" data-tab="outbound">红区外发</button>
-              <button class="tab" data-tab="members">成员权限</button>
-              <button class="tab" data-tab="audit">审计日志</button>
             </nav>
 
             <section id="tab-files" class="tab-panel">
-              <div class="flow card"><span class="zone green">绿区上传</span><i>→</i><span>隔离暂存</span><i>→</i><span>类型 + 病毒扫描</span><i>→</i><span class="zone red">红区下载</span></div>
+              <div class="flow card"><span class="zone green">绿区上传</span><i>→</i><span>隔离暂存</span><i>→</i><span>类型 + 病毒扫描</span><i>→</i><span class="zone red">红区本人下载</span></div>
               <form id="upload-form" class="upload card">
-                <div><h3>上传至隔离区</h3><p>基于文件内容识别类型；扩展名不作为信任依据。</p></div>
+                <div><h3>上传至隔离区</h3><p>基于文件内容识别类型；扩展名不作为信任依据。仅本人可见、本人可下载。</p></div>
                 <input id="file-input" type="file" required>
                 <button class="primary" type="submit">上传并扫描</button>
               </form>
-              <div id="object-table-card" class="table-card card"><div class="table-heading"><h3 id="object-table-title">文件对象</h3><span id="object-count"></span></div>
+              <div id="object-table-card" class="table-card card"><div class="table-heading"><h3 id="object-table-title">我的文件对象</h3><span id="object-count"></span></div>
                 <div class="table-wrap"><table><thead><tr><th>文件</th><th>真实类型</th><th>SHA-256</th><th>状态</th><th>大小</th><th>操作</th></tr></thead><tbody id="object-rows"></tbody></table></div>
               </div>
             </section>
 
             <section id="tab-outbound" class="tab-panel" hidden>
-              <div class="flow card"><span class="zone red">红区上传</span><i>→</i><span>隔离扫描与分类</span><i>→</i><span>审批</span><i>→</i><span class="zone green">绿区下载</span></div>
-              <form id="outbound-policy-form" class="card config-form">
-                <div class="config-title"><div><h3>项目外发策略</h3><p>项目管理员配置。企业微信接口已预留；本地测试请选择 Local。</p></div><button class="primary" type="submit">保存策略</button></div>
-                <div class="config-fields"><label class="check-label"><input id="outbound-enabled" type="checkbox"> 启用红区外发</label><label>审批提供者<select id="outbound-provider"><option value="local">Local 本地审批</option><option value="wecom">WeCom 企业微信</option></select></label><label>审批超时（小时）<input id="outbound-approval-hours" type="number" min="1" max="720"></label><label>绿区下载有效期（小时）<input id="outbound-download-hours" type="number" min="1" max="8760"></label><label class="check-label"><input class="outbound-class" type="checkbox" value="GDS"> GDS</label><label class="check-label"><input class="outbound-class" type="checkbox" value="FPGA_BITFILE"> FPGA Bitfile</label><label class="check-label"><input class="outbound-class" type="checkbox" value="GENERAL"> General</label></div>
-              </form>
-              <form id="outbound-upload-form" class="upload card"><div><h3>从红区提交外发</h3><p>需要 red_uploader 角色；未知类型和扩展名冲突默认隔离。</p></div><input id="outbound-file" type="file" required><button class="primary" type="submit">上传并发起审批</button></form>
+              <div class="flow card"><span class="zone red">红区上传</span><i>→</i><span>隔离扫描与分类</span><i>→</i><span>审批</span><i>→</i><span class="zone green">绿区本人下载</span></div>
+              <form id="outbound-upload-form" class="upload card"><div><h3>从红区提交外发</h3><p>提交后进入审批流程；未知类型和扩展名冲突默认隔离。仅提交人和审批员可见。</p></div><input id="outbound-file" type="file" required><button class="primary" type="submit">上传并发起审批</button></form>
               <div class="table-card card"><div class="table-heading"><h3>外发申请</h3><button id="outbound-refresh" class="secondary" type="button">刷新</button></div><div class="table-wrap"><table><thead><tr><th>文件</th><th>分类</th><th>状态</th><th>申请人</th><th>审批人</th><th>有效期</th><th>操作</th></tr></thead><tbody id="outbound-rows"></tbody></table></div></div>
             </section>
-
-            <section id="tab-members" class="tab-panel" hidden>
-              <form id="member-form" class="card inline-form"><div><h3>添加项目成员</h3><p>角色遵循最小权限，平台管理员不会绕过项目权限。</p></div>
-                <label>用户名<input id="member-user" required placeholder="例如 alice"></label>
-                <label>角色<select id="member-role"><option value="uploader">绿区上传者</option><option value="downloader">红区下载者</option><option value="red_uploader">红区外发上传者</option><option value="approver">外发审批人</option><option value="green_downloader">绿区外发下载者</option><option value="auditor">审计员</option><option value="admin">项目管理员</option></select></label>
-                <button class="primary" type="submit">授权</button>
-              </form>
-              <form id="network-policy-form" class="card config-form admin-section"><div class="config-title"><div><h3>上传来源 IP 白名单</h3><p>每行一个 IP 或 CIDR；生产模式校验证书绑定可信网关覆盖后的原始客户端地址，本地模式校验直连地址。</p></div><button class="primary" type="submit">保存 IP 策略</button></div><div class="network-fields"><label>绿区文件上传允许范围<textarea id="inbound-cidrs" rows="5" placeholder="10.10.0.0/16"></textarea></label><label>红区文件外发允许范围<textarea id="outbound-cidrs" rows="5" placeholder="10.20.0.0/16"></textarea></label></div></form>
-              <div class="table-card card admin-section"><div class="table-heading"><h3>当前项目成员</h3><button id="members-refresh" class="secondary" type="button">刷新</button></div><div class="table-wrap"><table><thead><tr><th>用户</th><th>角色</th><th>操作</th></tr></thead><tbody id="member-rows"></tbody></table></div></div>
-              <div class="card info"><h3>本地测试身份</h3><p><code>alice / alice123</code> 用于绿区上传，<code>reader / reader123</code> 用于红区下载。请先由项目管理员授予对应角色。</p></div>
-            </section>
-
-            <section id="tab-audit" class="tab-panel" hidden>
-              <div class="table-card card"><div class="table-heading"><h3>追加式审计事件</h3><span>最近 500 条</span></div>
-                <div class="table-wrap"><table><thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>结果</th><th>区域</th><th>对象</th></tr></thead><tbody id="audit-rows"></tbody></table></div>
-              </div>
-            </section>
           </div>
+
           <div id="admin-view" hidden>
-            <div class="title-row"><div><p class="eyebrow">PLATFORM ADMINISTRATION</p><h1>管理员后台</h1><p class="subtle">统计、配置和安全处置相互分离。</p></div><button id="admin-refresh" class="secondary">刷新当前页面</button></div>
+            <div class="title-row"><div><p class="eyebrow">PLATFORM ADMINISTRATION</p><h1>管理员后台</h1><p class="subtle">统计、全局策略和安全处置相互分离。</p></div><button id="admin-refresh" class="secondary">刷新当前页面</button></div>
             <nav class="admin-tabs"><button class="admin-tab active" data-admin-page="overview">统计总览</button><button class="admin-tab" data-admin-page="config">系统配置</button><button class="admin-tab" data-admin-page="operations">安全处置</button></nav>
 
             <section id="admin-page-overview" class="admin-page">
-              <div class="metric-grid"><div class="metric card"><span>用户</span><strong id="metric-users">0</strong></div><div class="metric card"><span>项目</span><strong id="metric-projects">0</strong></div><div class="metric card"><span>文件对象</span><strong id="metric-objects">0</strong></div><div class="metric card"><span>存储数据</span><strong id="metric-bytes">0 B</strong></div><div class="metric card"><span>安全余量后可用</span><strong id="metric-storage-available">0 B</strong></div><div class="metric card"><span>进行中上传</span><strong id="metric-active-uploads">0</strong></div><div class="metric card"><span>分片暂存</span><strong id="metric-staged-bytes">0 B</strong></div><div class="metric card"><span>待处理扫描任务</span><strong id="metric-scan-jobs">0</strong></div><div class="metric card"><span>审计链校验</span><strong id="metric-audit-chain">—</strong></div></div>
+              <div class="metric-grid"><div class="metric card"><span>用户</span><strong id="metric-users">0</strong></div><div class="metric card"><span>文件对象</span><strong id="metric-objects">0</strong></div><div class="metric card"><span>存储数据</span><strong id="metric-bytes">0 B</strong></div><div class="metric card"><span>安全余量后可用</span><strong id="metric-storage-available">0 B</strong></div><div class="metric card"><span>进行中上传</span><strong id="metric-active-uploads">0</strong></div><div class="metric card"><span>分片暂存</span><strong id="metric-staged-bytes">0 B</strong></div><div class="metric card"><span>待处理扫描任务</span><strong id="metric-scan-jobs">0</strong></div><div class="metric card"><span>审计链校验</span><strong id="metric-audit-chain">—</strong></div></div>
               <div class="table-card card"><div class="table-heading"><h3>对象安全状态</h3><span>全平台</span></div><div id="state-summary" class="state-summary"></div></div>
-              <div class="table-card card admin-section"><div class="table-heading"><h3>全局安全事件</h3><span>最近 100 条</span></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>结果</th><th>项目</th><th>区域</th></tr></thead><tbody id="admin-event-rows"></tbody></table></div></div>
+              <div class="table-card card admin-section"><div class="table-heading"><h3>全局安全事件</h3><span>最近 100 条</span></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>结果</th><th>区域</th><th>对象</th></tr></thead><tbody id="admin-event-rows"></tbody></table></div></div>
             </section>
 
             <section id="admin-page-config" class="admin-page" hidden>
-              <form id="security-config-form" class="card config-form"><div class="config-title"><div><h3>安全、扫描与大文件传输策略</h3><p>开发模式保存后立即生效；生产修改会触发指纹漂移并关闭数据面，必须完成变更审批、生成新指纹、严格预检和重启。扫描失败或存储余量不足始终失败关闭。</p></div><button class="primary" type="submit">保存/暂存配置</button></div><div class="config-fields"><label>保留时间（小时）<input id="config-retention" type="number" min="1" max="8760" required></label><label>单文件上限（MB）<input id="config-upload" type="number" min="1" max="1048576" required></label><label>分片大小（MB）<input id="config-chunk" type="number" min="1" max="128" required></label><label>上传会话有效期（小时）<input id="config-upload-session" type="number" min="1" max="168" required></label><label>每用户并发上传会话<input id="config-active-uploads" type="number" min="1" max="100" required></label><label>每项目暂存预留上限（GB）<input id="config-staged-gb" type="number" min="1" max="1048576" required></label><label>磁盘安全余量（GB）<input id="config-min-free-gb" type="number" min="0" max="1048576" required></label><label>扫描器组合<input id="config-scanners" placeholder="mock 或 clamav,yara" required></label><label>ClamAV 主机<input id="config-clam-host" placeholder="127.0.0.1"></label><label>ClamAV 端口<input id="config-clam-port" type="number" min="1" max="65535"></label><label>ClamAV 声明流上限（MB，只读）<input id="config-clam-stream" readonly></label><label>YARA 规则路径<input id="config-yara" placeholder="/absolute/path/rules.yar"></label></div></form>
-              <form id="admin-user-form" class="card config-form admin-section"><div class="config-title"><div><h3>创建本地账号</h3><p>账号可随后加入项目；密码至少 8 位。</p></div><button class="primary" type="submit">创建账号</button></div><div class="config-fields user-fields"><label>用户名<input id="admin-new-user" required></label><label>初始密码<input id="admin-new-password" type="password" minlength="8" required></label><label class="check-label"><input id="admin-new-global" type="checkbox"> 平台管理员</label></div></form>
-              <form id="service-identity-form" class="card config-form admin-section"><div class="config-title"><div><h3>创建非交互服务身份</h3><p>服务身份不能使用密码或 LDAP 登录；创建后请在项目成员页为其分配最小角色。</p></div><button class="primary" type="submit">创建服务身份</button></div><div class="config-fields user-fields"><label>服务身份用户名<input id="service-identity-user" placeholder="red-agent" required></label></div></form>
-              <form id="service-token-form" class="card config-form admin-section"><div class="config-title"><div><h3>Transfer Agent 服务令牌</h3><p>令牌仅显示一次，并绑定单一项目、区域和传输方向；只能签发给已配置对应项目角色的非交互服务身份。生产基线最长 30 天。</p></div><button class="primary" type="submit">签发令牌</button></div><div class="config-fields"><label>用途标签<input id="service-token-label" maxlength="100" placeholder="红区下载代理" required></label><label>服务身份用户名<input id="service-token-user" placeholder="red-agent" required></label><label>项目 ID<input id="service-token-project" placeholder="chip-a" required></label><label>绑定区域<select id="service-token-zone"><option value="green">绿区</option><option value="red">红区</option></select></label><label>有效期（小时）<input id="service-token-hours" type="number" min="1" max="720" value="720" required></label><fieldset><legend>允许操作</legend><label class="check-label"><input class="service-token-permission" type="checkbox" value="inbound_upload"> 绿区入站上传</label><label class="check-label"><input class="service-token-permission" type="checkbox" value="inbound_download"> 红区入站下载</label><label class="check-label"><input class="service-token-permission" type="checkbox" value="outbound_upload"> 红区外发上传</label><label class="check-label"><input class="service-token-permission" type="checkbox" value="outbound_download"> 绿区外发下载</label></fieldset></div></form>
-              <div class="table-card card admin-section"><div class="table-heading"><h3>已签发服务令牌</h3><span>仅显示标识和范围，不保存明文密钥</span></div><div class="table-wrap"><table><thead><tr><th>标签</th><th>身份</th><th>项目</th><th>区域/权限</th><th>到期时间</th><th>最近使用</th><th>状态</th><th>操作</th></tr></thead><tbody id="service-token-rows"></tbody></table></div></div>
-              <div class="table-card card admin-section"><div class="table-heading"><h3>用户与服务身份</h3><span>人员账号和机器身份明确分离</span></div><div class="table-wrap"><table><thead><tr><th>用户</th><th>类型</th><th>状态</th><th>项目数</th><th>项目角色</th><th>操作</th></tr></thead><tbody id="admin-user-rows"></tbody></table></div></div>
-              <div class="table-card card admin-section"><div class="table-heading"><h3>全部项目</h3><span>可改名、归档</span></div><div class="table-wrap"><table><thead><tr><th>项目</th><th>项目 ID</th><th>成员</th><th>对象</th><th>数据量</th><th>创建时间</th><th>操作</th></tr></thead><tbody id="admin-project-rows"></tbody></table></div></div>
+              <form id="security-config-form" class="card config-form"><div class="config-title"><div><h3>安全、扫描与大文件传输策略</h3><p>开发模式保存后立即生效；生产修改会触发指纹漂移并关闭数据面，必须完成变更审批、生成新指纹、严格预检和重启。扫描失败或存储余量不足始终失败关闭。</p></div><button class="primary" type="submit">保存/暂存配置</button></div><div class="config-fields"><label>保留时间（小时）<input id="config-retention" type="number" min="1" max="8760" required></label><label>单文件上限（MB）<input id="config-upload" type="number" min="1" max="1048576" required></label><label>分片大小（MB）<input id="config-chunk" type="number" min="1" max="128" required></label><label>上传会话有效期（小时）<input id="config-upload-session" type="number" min="1" max="168" required></label><label>每用户并发上传会话<input id="config-active-uploads" type="number" min="1" max="100" required></label><label>每用户暂存预留上限（GB）<input id="config-staged-gb" type="number" min="1" max="1048576" required></label><label>磁盘安全余量（GB）<input id="config-min-free-gb" type="number" min="0" max="1048576" required></label><label>扫描器组合<input id="config-scanners" placeholder="mock 或 clamav,yara" required></label><label>ClamAV 主机<input id="config-clam-host" placeholder="127.0.0.1"></label><label>ClamAV 端口<input id="config-clam-port" type="number" min="1" max="65535"></label><label>ClamAV 声明流上限（MB，只读）<input id="config-clam-stream" readonly></label><label>YARA 规则路径<input id="config-yara" placeholder="/absolute/path/rules.yar"></label></div></form>
+              <form id="outbound-policy-form" class="card config-form admin-section"><div class="config-title"><div><h3>全局外发策略</h3><p>对所有用户生效。企业微信接口已预留；本地测试请选择 Local。</p></div><button class="primary" type="submit">保存外发策略</button></div><div class="config-fields"><label class="check-label"><input id="outbound-enabled" type="checkbox"> 启用红区外发</label><label>审批提供者<select id="outbound-provider"><option value="local">Local 本地审批</option><option value="wecom">WeCom 企业微信</option></select></label><label>审批超时（小时）<input id="outbound-approval-hours" type="number" min="1" max="720"></label><label>绿区下载有效期（小时）<input id="outbound-download-hours" type="number" min="1" max="8760"></label><label class="check-label"><input class="outbound-class" type="checkbox" value="GDS"> GDS</label><label class="check-label"><input class="outbound-class" type="checkbox" value="FPGA_BITFILE"> FPGA Bitfile</label><label class="check-label"><input class="outbound-class" type="checkbox" value="GENERAL"> General</label></div></form>
+              <form id="network-policy-form" class="card config-form admin-section"><div class="config-title"><div><h3>上传来源 IP 白名单</h3><p>全局策略；每行一个 IP 或 CIDR。生产模式校验证书绑定可信网关覆盖后的原始客户端地址，本地模式校验直连地址。</p></div><button class="primary" type="submit">保存 IP 策略</button></div><div class="network-fields"><label>绿区文件上传允许范围<textarea id="inbound-cidrs" rows="5" placeholder="10.10.0.0/16"></textarea></label><label>红区文件外发允许范围<textarea id="outbound-cidrs" rows="5" placeholder="10.20.0.0/16"></textarea></label></div></form>
+              <form id="ldap-sync-form" class="card config-form admin-section"><div class="config-title"><div><h3>LDAP 目录同步</h3><p>从企业 LDAP/AD 同步用户目录：导入用户、按组授予审批员、可选停用已离职账号。仅停用由同步导入且目录中已缺失的用户，绝不影响本地账号和平台管理员。生产环境保存会触发配置指纹漂移，需按变更流程处理。</p></div><div class="ldap-sync-actions"><button id="ldap-sync-run" class="secondary" type="button">立即同步</button><button class="primary" type="submit">保存配置</button></div></div><div class="config-fields"><label class="check-label"><input id="ldap-sync-enabled" type="checkbox"> 启用同步</label><label>LDAP URI<input id="ldap-sync-uri" placeholder="ldaps://ad.example.internal:636"></label><label>Base DN<input id="ldap-sync-base" placeholder="dc=example,dc=internal"></label><label>Bind DN<input id="ldap-sync-bind-dn" placeholder="cn=sfss-sync,ou=service,dc=example,dc=internal"></label><label>Bind 密码<input id="ldap-sync-password" type="password" autocomplete="new-password" placeholder="留空表示保持不变"></label><label>用户过滤器<input id="ldap-sync-filter" placeholder="(objectClass=person)"></label><label>用户名属性<input id="ldap-sync-attr" placeholder="sAMAccountName 或 uid"></label><label>审批员组 DN（可选）<input id="ldap-sync-group" placeholder="cn=sfss-approvers,ou=groups,dc=example,dc=internal"></label><label class="check-label"><input id="ldap-sync-deprovision" type="checkbox"> 停用目录中已缺失的同步用户</label></div></form>
+              <div id="ldap-sync-status" class="card info admin-section" hidden><h3>最近同步结果</h3><p id="ldap-sync-status-text">尚未执行同步</p></div>
+              <form id="admin-user-form" class="card config-form admin-section"><div class="config-title"><div><h3>创建本地账号</h3><p>创建后可在用户表中授予平台管理员或审批员身份；密码至少 8 位。</p></div><button class="primary" type="submit">创建账号</button></div><div class="config-fields user-fields"><label>用户名<input id="admin-new-user" required></label><label>初始密码<input id="admin-new-password" type="password" minlength="8" required></label><label class="check-label"><input id="admin-new-global" type="checkbox"> 平台管理员</label></div></form>
+              <form id="service-identity-form" class="card config-form admin-section"><div class="config-title"><div><h3>创建非交互服务身份</h3><p>服务身份不能使用密码或 LDAP 登录，用于 sfss-agent 自动化传输。</p></div><button class="primary" type="submit">创建服务身份</button></div><div class="config-fields user-fields"><label>服务身份用户名<input id="service-identity-user" placeholder="red-agent" required></label></div></form>
+              <form id="service-token-form" class="card config-form admin-section"><div class="config-title"><div><h3>Transfer Agent 服务令牌</h3><p>令牌仅显示一次，绑定服务身份、区域和传输方向，只能签发给已启用的非交互服务身份。生产基线最长 30 天。</p></div><button class="primary" type="submit">签发令牌</button></div><div class="config-fields"><label>用途标签<input id="service-token-label" maxlength="100" placeholder="红区下载代理" required></label><label>服务身份用户名<input id="service-token-user" placeholder="red-agent" required></label><label>绑定区域<select id="service-token-zone"><option value="green">绿区</option><option value="red">红区</option></select></label><label>有效期（小时）<input id="service-token-hours" type="number" min="1" max="720" value="720" required></label><fieldset><legend>允许操作</legend><label class="check-label"><input class="service-token-permission" type="checkbox" value="inbound_upload"> 绿区入站上传</label><label class="check-label"><input class="service-token-permission" type="checkbox" value="inbound_download"> 红区入站下载</label><label class="check-label"><input class="service-token-permission" type="checkbox" value="outbound_upload"> 红区外发上传</label><label class="check-label"><input class="service-token-permission" type="checkbox" value="outbound_download"> 绿区外发下载</label></fieldset></div></form>
+              <div class="table-card card admin-section"><div class="table-heading"><h3>已签发服务令牌</h3><span>仅显示标识和范围，不保存明文密钥</span></div><div class="table-wrap"><table><thead><tr><th>标签</th><th>身份</th><th>区域/权限</th><th>到期时间</th><th>最近使用</th><th>状态</th><th>操作</th></tr></thead><tbody id="service-token-rows"></tbody></table></div></div>
+              <div class="table-card card admin-section"><div class="table-heading"><h3>用户与服务身份</h3><span>平台管理员、审批员与机器身份分列管理</span></div><div class="table-wrap"><table><thead><tr><th>用户</th><th>类型</th><th>状态</th><th>身份</th><th>文件数</th><th>操作</th></tr></thead><tbody id="admin-user-rows"></tbody></table></div></div>
             </section>
 
             <section id="admin-page-operations" class="admin-page" hidden>
               <div class="card info"><h3>安全处置原则</h3><p>允许重新扫描隔离对象或让对象提前过期，但不允许管理员绕过扫描直接放行。</p></div>
               <div class="table-card card admin-section"><div class="table-heading"><div><h3>活动人工会话</h3><span id="session-policy-summary">只显示仍在绝对与空闲有效期内的会话，不显示令牌或摘要</span></div><button id="revoke-all-sessions" class="secondary danger" type="button">紧急撤销全部人工会话</button></div><div class="table-wrap"><table><thead><tr><th>用户</th><th>认证后端</th><th>绑定入口</th><th>创建时间</th><th>最近活动</th><th>绝对到期</th><th>操作</th></tr></thead><tbody id="admin-session-rows"></tbody></table></div></div>
-              <div class="table-card card admin-section"><div class="table-heading"><h3>待审批外发</h3><span>仅显示当前管理员具有 approver 角色的项目</span></div><div class="table-wrap"><table><thead><tr><th>文件</th><th>项目</th><th>分类</th><th>申请人</th><th>截止时间</th><th>操作</th></tr></thead><tbody id="admin-approval-rows"></tbody></table></div></div>
-              <div class="table-card card admin-section"><div class="table-heading"><h3>文件对象控制</h3><span>重扫与过期</span></div><div class="table-wrap"><table><thead><tr><th>文件</th><th>项目</th><th>类型</th><th>状态</th><th>大小</th><th>操作</th></tr></thead><tbody id="admin-object-rows"></tbody></table></div></div>
+              <div class="table-card card admin-section"><div class="table-heading"><h3>待审批外发</h3><span>平台审批员可处理全部待审批申请</span></div><div class="table-wrap"><table><thead><tr><th>文件</th><th>分类</th><th>申请人</th><th>截止时间</th><th>操作</th></tr></thead><tbody id="admin-approval-rows"></tbody></table></div></div>
+              <div class="table-card card admin-section"><div class="table-heading"><h3>文件对象控制</h3><span>重扫与过期</span></div><div class="table-wrap"><table><thead><tr><th>文件</th><th>上传人</th><th>类型</th><th>状态</th><th>大小</th><th>操作</th></tr></thead><tbody id="admin-object-rows"></tbody></table></div></div>
+              <div class="table-card card admin-section"><div class="table-heading"><h3>全局审计事件</h3><span>最近 500 条</span></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>结果</th><th>区域</th><th>对象</th></tr></thead><tbody id="admin-audit-rows"></tbody></table></div></div>
             </section>
           </div>
         </section>
       </div>
     </section>
   </main>
-
-  <dialog id="project-dialog"><form id="project-form" method="dialog" class="dialog-form"><div class="dialog-head"><h2>创建项目</h2><button type="button" id="close-dialog" class="icon">×</button></div><label>项目 ID<input id="project-id" pattern="[A-Za-z0-9-]+" placeholder="chip-a" required></label><label>项目名称<input id="project-name" placeholder="Chip A" required></label><button class="primary" type="submit">创建并进入</button></form></dialog>
   <script src="/app.js"></script>
 </body>
 </html>
