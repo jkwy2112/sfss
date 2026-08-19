@@ -179,7 +179,7 @@ class OutboundSystemTest(DeploymentModeTestBase):
         status, _, _ = self.request(
             "GET", f"/v1/outbound/{transfer['id']}/download",
             headers=self.login_headers("r", "green"))
-        self.assertEqual(404, status)  # only the submitting user may download
+        self.assertEqual(404, status)  # only the submitting user may receive the release
         status, _, downloaded = self.request(
             "GET", f"/v1/outbound/{transfer['id']}/download",
             headers=self.login_headers("a", "green"))

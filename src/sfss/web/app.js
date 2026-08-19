@@ -11,11 +11,38 @@ async function api(path, options={}){
   if(state.token) headers.set("Authorization",`Bearer ${state.token}`);
   if(!state.token && !["GET","HEAD"].includes((options.method||"GET").toUpperCase()) && path!=="/v1/auth/login") headers.set("X-SFSS-CSRF","1");
   if(portal==="green"||portal==="red") headers.set("X-SFSS-Zone",portal);
+  if(portal==="admin") headers.set("X-SFSS-Gateway-Role","admin");
   if(options.json){ headers.set("Content-Type","application/json"); options.body=JSON.stringify(options.json); }
   const response=await fetch(path,{...options,headers,credentials:"same-origin"});
-  if(response.status===401){ logout(); throw new Error("登录已失效，请重新登录"); }
+  if(response.status===401){
+    if(path==="/v1/auth/login" || !state.token){ logout(); throw new Error("用户名或密码错误"); }
+    // 入口不匹配时,会话本身可能仍有效:找到它所属的门户并自动跳转过去
+    const target=await findSessionEntrance();
+    if(target && target!==portal && target!=="development"){
+      toast(`当前登录会话属于${target==="admin"?"管理后台":target+"门户"},正在跳转…`);
+      location.replace(target==="admin"?"/admin":`/${target}`);
+      throw new Error("正在跳转到正确的门户…");
+    }
+    logout(); throw new Error("登录已失效,请重新登录");
+  }
   if(!response.ok){ let data={}; try{data=await response.json()}catch{} throw new Error(data.error || `请求失败 (${response.status})`); }
   return response.status===204 ? null : response.json();
+}
+async function findSessionEntrance(){
+  if(!state.token) return null;
+  const probes=[
+    {zone:"development", headers:{}},                    // 裸请求 = development 入口
+    {zone:"green",  headers:{"X-SFSS-Zone":"green"}},
+    {zone:"red",    headers:{"X-SFSS-Zone":"red"}},
+    {zone:"admin",  headers:{"X-SFSS-Gateway-Role":"admin"}},
+  ];
+  for(const probe of probes){
+    try{
+      const response=await fetch("/v1/me",{headers:{Authorization:`Bearer ${state.token}`,...probe.headers}});
+      if(response.ok) return probe.zone;
+    }catch{}
+  }
+  return null;
 }
 async function downloadFile(path,record,zone){
   const headers={"X-SFSS-Zone":zone};if(state.token)headers.Authorization=`Bearer ${state.token}`;
@@ -41,10 +68,13 @@ async function downloadFile(path,record,zone){
     await writable.close();
   }catch(err){try{await writable.abort();}catch{}throw err;}
 }
-function showLogin(){ $("#login-view").hidden=false; $("#app-view").hidden=true; }
+function showLogin(){ $("#login-view").hidden=false; $("#app-view").hidden=true; clearLoginForm(); }
+function clearLoginForm(){ const form=$("#login-form"); if(form){ $("#username").value=""; $("#password").value=""; $("#login-error").hidden=true; } }
+document.addEventListener("DOMContentLoaded",()=>{ const u=$("#username"); if(u){ u.setAttribute("autocomplete","off"); } });
 function showApp(){ $("#login-view").hidden=true; $("#app-view").hidden=false; $("#current-user").textContent=state.user; renderSpaceCard(); }
-function logout(){ state.token=""; state.cookieSession=false; state.user=""; sessionStorage.removeItem("sfss_token"); showLogin(); }
+function logout(){ state.token=""; state.cookieSession=false; state.user=""; state.globalAdmin=false; state.approver=false; sessionStorage.removeItem("sfss_token"); showLogin(); }
 async function performLogout(){try{await api("/v1/auth/logout",{method:"POST"});}catch{}finally{logout();}}
+function switchAccount(){ logout(); }
 function renderSpaceCard(){
   const card=$("#space-card");
   const badges=[];
@@ -66,7 +96,7 @@ applyPortalLayout();
 
 $("#login-form").addEventListener("submit",async event=>{
   event.preventDefault(); const error=$("#login-error"); error.hidden=true;
-  try{ const result=await api("/v1/auth/login",{method:"POST",json:{username:$("#username").value,password:$("#password").value}}); state.token=result.token||"";state.cookieSession=result.session_transport==="cookie";if(state.token)sessionStorage.setItem("sfss_token",state.token);else sessionStorage.removeItem("sfss_token"); const me=await api("/v1/me");state.user=me.username;state.globalAdmin=me.global_admin;state.approver=Boolean(me.approver);state.deploymentMode=me.deployment_mode||"combined";showApp(); await loadHealth(); await renderWorkspace(); }
+  try{ const result=await api("/v1/auth/login",{method:"POST",json:{username:$("#username").value,password:$("#password").value}}); clearLoginForm(); state.token=result.token||"";state.cookieSession=result.session_transport==="cookie";if(state.token)sessionStorage.setItem("sfss_token",state.token);else sessionStorage.removeItem("sfss_token"); const me=await api("/v1/me");state.user=me.username;state.globalAdmin=me.global_admin;state.approver=Boolean(me.approver);state.deploymentMode=me.deployment_mode||"combined";toast(`已登录:${state.user}${me.global_admin?"(平台管理员)":""}`);showApp(); await loadHealth(); await renderWorkspace(); }
   catch(err){ error.textContent=err.message; error.hidden=false; }
 });
 $("#logout").addEventListener("click",performLogout);
@@ -74,6 +104,9 @@ $("#logout").addEventListener("click",performLogout);
 async function loadHealth(){ try{const health=await api("/health"); $("#scanner-state").textContent=health.status==="ok"?"服务在线":"服务异常";}catch{} }
 
 async function renderWorkspace(){
+  if(portal==="admin"&&!state.globalAdmin){
+    renderAdminDenied();return;
+  }
   $("#admin-console").hidden=!(state.globalAdmin&&(portal==="combined"||portal==="admin"));
   if(location.pathname==="/admin"&&state.globalAdmin){ await openAdmin(); return; }
   $("#admin-view").hidden=true; $("#main-view").hidden=false; $("#back-to-files").hidden=true;
@@ -97,6 +130,20 @@ async function renderWorkspace(){
   if(inboundAvailable){ activateTab("files"); await loadObjects(); }
   else{ activateTab("outbound"); await loadOutbound(); }
 }
+function renderAdminDenied(){
+  $("#admin-console").hidden=true;$("#back-to-files").hidden=true;
+  $("#main-view").hidden=true;$("#admin-view").hidden=false;
+  $("#admin-view").replaceChildren();
+  const box=document.createElement("div");box.className="empty card";box.style.marginTop="8vh";
+  const h=document.createElement("h2");h.textContent="无权访问管理后台";
+  const p=document.createElement("p");p.className="subtle";
+  p.textContent=`账号 ${state.user} 不是平台管理员。即将返回个人空间…`;
+  const btn=document.createElement("button");btn.className="primary";btn.textContent="立即返回个人空间";
+  btn.onclick=()=>location.replace("/");
+  box.append(h,p,btn);$("#admin-view").append(box);
+  clearTimeout(window.adminDeniedTimer);
+  window.adminDeniedTimer=setTimeout(()=>location.replace("/"),3000);
+}
 function activateTab(name){document.querySelectorAll(".tab").forEach(button=>button.classList.toggle("active",button.dataset.tab===name));document.querySelectorAll(".tab-panel").forEach(panel=>panel.hidden=panel.id!==`tab-${name}`);}
 
 async function openAdmin(){$("#main-view").hidden=true;$("#admin-view").hidden=false;$("#back-to-files").hidden=portal==="admin";await loadAdmin();}
@@ -107,7 +154,9 @@ document.querySelectorAll(".admin-tab").forEach(button=>button.onclick=()=>{docu
 async function loadAdmin(){
   try{const [data,config,serviceTokens,humanSessions]=await Promise.all([api("/v1/admin/overview"),api("/v1/admin/config"),api("/v1/admin/service-tokens"),api("/v1/admin/sessions")]);$("#metric-users").textContent=data.counts.users;$("#metric-objects").textContent=data.counts.objects;$("#metric-bytes").textContent=formatSize(data.counts.bytes);$("#metric-storage-available").textContent=formatSize(data.storage?.available_bytes||0);$("#metric-active-uploads").textContent=data.counts.active_uploads||0;$("#metric-staged-bytes").textContent=formatSize(data.counts.staged_bytes||0);$("#metric-scan-jobs").textContent=(data.queue?.queued||0)+(data.queue?.running||0);$("#metric-audit-chain").textContent=`已验证 ${data.audit_chain?.events||0} 条`;
     $("#config-retention").value=config.retention_hours;$("#config-upload").value=config.max_upload_mb;$("#config-chunk").value=config.multipart_chunk_mb;$("#config-upload-session").value=config.upload_session_hours;$("#config-active-uploads").value=config.max_active_uploads_per_user;$("#config-staged-gb").value=config.max_staged_gb_per_user;$("#config-min-free-gb").value=config.min_free_gb;$("#config-scanners").value=config.scanners;$("#config-clam-host").value=config.clamav_host;$("#config-clam-port").value=config.clamav_port;$("#config-clam-stream").value=config.clamav_stream_max_mb;$("#config-yara").value=config.yara_rules;$("#service-token-hours").max=config.service_token_max_hours;if(Number($("#service-token-hours").value)>config.service_token_max_hours)$("#service-token-hours").value=config.service_token_max_hours;
-    try{const policy=await api("/v1/admin/outbound-policy");$("#outbound-enabled").checked=Boolean(policy.enabled);const localOption=$("#outbound-provider").querySelector('option[value="local"]');localOption.disabled=!policy.local_approval_allowed;$("#outbound-provider").value=policy.approval_provider;$("#outbound-approval-hours").value=policy.approval_timeout_hours;$("#outbound-download-hours").value=policy.download_ttl_hours;document.querySelectorAll(".outbound-class").forEach(input=>input.checked=policy.allowed_classifications.includes(input.value));}catch{}
+    const outboundAvailable=state.deploymentMode==="outbound"||state.deploymentMode==="combined";
+    document.querySelectorAll("[data-outbound-only]").forEach(el=>el.hidden=!outboundAvailable);
+    if(outboundAvailable) try{const policy=await api("/v1/admin/outbound-policy");$("#outbound-enabled").checked=Boolean(policy.enabled);const localOption=$("#outbound-provider").querySelector('option[value="local"]');localOption.disabled=!policy.local_approval_allowed;$("#outbound-provider").value=policy.approval_provider;$("#outbound-approval-hours").value=policy.approval_timeout_hours;$("#outbound-download-hours").value=policy.download_ttl_hours;document.querySelectorAll(".outbound-class").forEach(input=>input.checked=policy.allowed_classifications.includes(input.value));}catch{}
     try{const network=await api("/v1/admin/network-policy");$("#inbound-cidrs").value=network.inbound_upload_cidrs.join("\n");$("#outbound-cidrs").value=network.outbound_upload_cidrs.join("\n");}catch{}
     try{const ldap=await api("/v1/admin/ldap-sync");$("#ldap-sync-enabled").checked=Boolean(ldap.enabled);$("#ldap-sync-uri").value=ldap.uri||"";$("#ldap-sync-base").value=ldap.base_dn||"";$("#ldap-sync-bind-dn").value=ldap.bind_dn||"";$("#ldap-sync-password").value="";$("#ldap-sync-password").placeholder=ldap.bind_password_set?"已配置，留空保持不变":"";$("#ldap-sync-filter").value=ldap.user_filter||"";$("#ldap-sync-attr").value=ldap.username_attribute||"";$("#ldap-sync-group").value=ldap.approver_group_dn||"";$("#ldap-sync-deprovision").checked=Boolean(ldap.deprovision_missing);renderLdapSyncStatus(ldap.last_run);}catch{}
     const summary=$("#state-summary");summary.replaceChildren();Object.entries(statusNames).forEach(([key,label])=>{const item=document.createElement("div");item.className="state-item";const name=document.createElement("span");name.textContent=`入站 · ${label}`;const count=document.createElement("strong");count.textContent=data.states[key]||0;item.append(name,count);summary.append(item);});Object.entries(outboundStatusNames).forEach(([key,label])=>{const countValue=data.outbound_states?.[key]||0;if(!countValue)return;const item=document.createElement("div");item.className="state-item";const name=document.createElement("span");name.textContent=`外发 · ${label}`;const count=document.createElement("strong");count.textContent=countValue;item.append(name,count);summary.append(item);});
@@ -208,4 +257,14 @@ async function downloadOutbound(transfer){try{await downloadFile(`/v1/outbound/$
 document.querySelectorAll(".tab").forEach(button=>button.onclick=async()=>{document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("active",b===button));document.querySelectorAll(".tab-panel").forEach(panel=>panel.hidden=panel.id!==`tab-${button.dataset.tab}`);if(button.dataset.tab==="outbound")await loadOutbound();if(button.dataset.tab==="files")await loadObjects();});
 $("#refresh").onclick=async()=>{if(!$("#tab-outbound").hidden)await loadOutbound();else await loadObjects();toast("状态已刷新");};
 
-(async()=>{try{const me=await api("/v1/me");state.cookieSession=!state.token;state.user=me.username;state.globalAdmin=me.global_admin;state.approver=Boolean(me.approver);state.deploymentMode=me.deployment_mode||"combined";showApp();await loadHealth();await renderWorkspace();}catch{showLogin();}})();
+(async()=>{
+  // 恢复会话:若 sessionStorage 里的会话属于其他门户,自动跳转过去而不是报错
+  if(state.token){
+    const entrance=await findSessionEntrance();
+    if(entrance && entrance!=="development" && portal!=="combined" && entrance!==portal){
+      toast(`当前会话属于${entrance==="admin"?"管理后台":entrance+"门户"},正在跳转`);
+      location.replace(entrance==="admin"?"/admin":`/${entrance}`); return;
+    }
+  }
+  try{const me=await api("/v1/me");state.cookieSession=!state.token;state.user=me.username;state.globalAdmin=me.global_admin;state.approver=Boolean(me.approver);state.deploymentMode=me.deployment_mode||"combined";showApp();await loadHealth();await renderWorkspace();}catch{showLogin();}
+})();

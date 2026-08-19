@@ -821,9 +821,12 @@ class SFSSService:
         return self.get_outbound(transfer_id)
 
     def outbound_for_download(self, transfer_id: str, actor: str) -> Dict:
+        # An approved release stays personal: only the submitting user (or a
+        # platform administrator for recovery) may receive it in green.
         transfer = self.get_outbound(transfer_id)
         if transfer["uploader"] != actor and not self.store.is_global_admin(actor):
             raise ServiceError(404, "outbound transfer not found")
+        self._require_active_user(actor)
         if transfer["state"] == "released_to_green" and transfer["download_expires_at"] <= int(time.time()): self.outbound_transition(transfer_id, "expired"); transfer = self.get_outbound(transfer_id)
         if transfer["state"] != "released_to_green": raise ServiceError(409, "outbound transfer is not released to green")
         if not self.outbound_policy()["enabled"]:

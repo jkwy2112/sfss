@@ -601,7 +601,7 @@ class HttpTest(unittest.TestCase):
         status, _, _ = self.request("GET", f"/v1/outbound/{transfer['id']}/download", headers={"Authorization":"Bearer a","X-SFSS-Zone":"red"})
         self.assertEqual(403, status)
         status, _, _ = self.request("GET", f"/v1/outbound/{transfer['id']}/download", headers={"Authorization":"Bearer r","X-SFSS-Zone":"green"})
-        self.assertEqual(404, status)  # only the submitting user may download their own release
+        self.assertEqual(404, status)  # only the submitting user may receive the release
         status, _, downloaded = self.request("GET", f"/v1/outbound/{transfer['id']}/download", headers={"Authorization":"Bearer a","X-SFSS-Zone":"green"})
         self.assertEqual(200, status); self.assertEqual(body, downloaded)
 
@@ -712,6 +712,28 @@ class HttpTest(unittest.TestCase):
             "Authorization":"Bearer p", "X-SFSS-Zone":"red"})
         self.assertIn(transfer["id"],
                       [row["id"] for row in json.loads(payload)["transfers"]])  # approver sees all
+
+    def test_green_released_outbound_list_is_personal_even_for_admin(self):
+        own = self.service.upload_outbound("own-release.txt", io.BytesIO(b"own"), 3, "alice")
+        other = self.service.upload_outbound("other-release.txt", io.BytesIO(b"other"), 5, "reader")
+        for record in (own, other):
+            self.service.decide_outbound(record["id"], True, "approved", "approver")
+        # Even a platform administrator/approver sees only their own releases
+        # in the green personal portal; everything else lives in the console.
+        body = json.dumps({"username": "admin", "password": "admin123"}).encode()
+        status, _, payload = self.request("POST", "/v1/auth/login", body, {
+            "Content-Type": "application/json", "Content-Length": str(len(body)),
+            "X-SFSS-Zone": "green"})
+        self.assertEqual(200, status)
+        admin_green = json.loads(payload)["token"]
+        status, _, payload = self.request("GET", "/v1/outbound", headers={
+            "Authorization":f"Bearer {admin_green}", "X-SFSS-Zone":"green"})
+        self.assertEqual([], [row["id"] for row in json.loads(payload)["transfers"]])
+        status, _, payload = self.request("GET", "/v1/outbound", headers={
+            "Authorization":"Bearer a", "X-SFSS-Zone":"green"})
+        rows = [row["id"] for row in json.loads(payload)["transfers"]]
+        self.assertEqual([own["id"]], rows)
+        self.assertNotIn(other["id"], rows)
 
     def test_static_console_has_security_headers(self):
         status, headers, _ = self.request("GET", "/")

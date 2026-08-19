@@ -162,6 +162,9 @@ def build_authenticator(settings: Settings, store=None):
             settings.allow_basic_auth,
             settings.session_idle_seconds,
             settings.max_sessions_per_user,
+            settings.bootstrap_admins,
+            settings.ldap_fallback_admin,
+            local_credentials(settings.local_credentials) if settings.ldap_fallback_admin else None,
         )
     raise ValueError("SFSS_AUTH_BACKEND must be local or ldap")
 
@@ -1206,9 +1209,13 @@ def make_handler(service: SFSSService, authenticator):
                 is_admin = service.store.is_global_admin(actor)
                 sees_all = is_admin or service.store.is_approver(actor)
                 if self.zone() == "green":
+                    # The green portal is a personal space: an approved release
+                    # is visible only to its submitter (the intended green
+                    # receiver). Admins/approvers inspect everything through
+                    # the management console instead.
                     rows = service.store.all(
-                        "SELECT * FROM outbound_transfers WHERE state='released_to_green' AND (uploader=? OR ?) "
-                        "ORDER BY created_at DESC,id DESC LIMIT 500", (actor, int(sees_all)))
+                        "SELECT * FROM outbound_transfers WHERE state='released_to_green' AND uploader=? "
+                        "ORDER BY created_at DESC,id DESC LIMIT 500", (actor,))
                 elif sees_all:
                     rows = service.store.all(
                         "SELECT * FROM outbound_transfers ORDER BY created_at DESC,id DESC LIMIT 500")
@@ -1446,11 +1453,14 @@ def create_runtime(settings: Settings):
         raise ValueError(f"production configuration fingerprint mismatch; observed {fingerprint}")
     bootstrap_admins = {name.strip() for name in settings.bootstrap_admins.split(",") if name.strip()}
     if settings.environment == "production" and settings.auth_backend == "ldap":
-        if store.one("SELECT username FROM local_accounts LIMIT 1"):
+        fallback = settings.ldap_fallback_admin
+        stray_local_accounts = [row["username"] for row in store.all(
+            "SELECT username FROM local_accounts") if row["username"] != fallback]
+        if stray_local_accounts:
             raise ValueError("unsafe production identity database: local accounts must not be migrated into LDAP production")
         unexpected_admins = [row["username"] for row in store.all(
             "SELECT username FROM users WHERE global_admin=1 AND enabled=1 AND principal_type='human'")
-            if row["username"] not in bootstrap_admins]
+            if row["username"] not in bootstrap_admins and row["username"] != fallback]
         if unexpected_admins:
             raise ValueError("unsafe production identity database: platform administrators are outside SFSS_BOOTSTRAP_ADMINS")
     revoked = store.one(
