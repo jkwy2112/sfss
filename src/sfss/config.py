@@ -108,6 +108,7 @@ class Settings:
     ldap_uri: str = "ldap://127.0.0.1:389"
     ldap_base_dn: str = "dc=example,dc=com"
     ldap_user_template: str = "uid={username},{base_dn}"
+    ldap_fallback_admin: str = ""
     ldap_ca_file: str = ""
     ldap_ca_sha256: str = ""
     allow_basic_auth: bool = True
@@ -182,6 +183,7 @@ class Settings:
             ldap_uri=os.getenv("SFSS_LDAP_URI", "ldap://127.0.0.1:389"),
             ldap_base_dn=os.getenv("SFSS_LDAP_BASE_DN", "dc=example,dc=com"),
             ldap_user_template=os.getenv("SFSS_LDAP_USER_TEMPLATE", "uid={username},{base_dn}"),
+            ldap_fallback_admin=os.getenv("SFSS_LDAP_FALLBACK_ADMIN", "").strip(),
             ldap_ca_file=os.getenv("SFSS_LDAP_CA_FILE", ""),
             ldap_ca_sha256=os.getenv("SFSS_LDAP_CA_SHA256", "").lower().strip(),
             allow_basic_auth=os.getenv("SFSS_ALLOW_BASIC_AUTH", "true").lower() in {"1", "true", "yes"},
@@ -305,6 +307,10 @@ class Settings:
                 self.ldap_user_template.format(username="preflight", base_dn=self.ldap_base_dn)
             except (KeyError, ValueError, IndexError) as exc:
                 raise ValueError("SFSS_LDAP_USER_TEMPLATE must use only {username} and optional {base_dn}") from exc
+            if self.ldap_fallback_admin:
+                identity_style = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._@+\-]{0,126}[A-Za-z0-9])?\Z")
+                if not identity_style.fullmatch(self.ldap_fallback_admin):
+                    raise ValueError("SFSS_LDAP_FALLBACK_ADMIN must be a single valid username")
             bootstrap = [value.strip() for value in self.bootstrap_admins.split(",") if value.strip()]
             identity_pattern = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._@+\-]{0,126}[A-Za-z0-9])?\Z")
             if any(not identity_pattern.fullmatch(value) for value in bootstrap):

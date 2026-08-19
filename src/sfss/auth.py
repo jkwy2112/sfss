@@ -348,13 +348,20 @@ class LDAPAuthenticator(Authenticator):
 
     def __init__(self, server_uri: str, base_dn: str, user_template: str = "{username}", store=None,
                  session_ttl_seconds: int = 8 * 3600, ca_file: str = "", allow_basic: bool = True,
-                 session_idle_seconds: int = 30 * 60, max_sessions_per_user: int = 3):
+                 session_idle_seconds: int = 30 * 60, max_sessions_per_user: int = 3,
+                 bootstrap_admins: str = "", fallback_admin: str = "",
+                 fallback_credentials: Optional[Dict[str, str]] = None):
         self.server_uri = server_uri
         self.base_dn = base_dn
         self.user_template = user_template
         self.store = store
         self.ca_file = ca_file
         self.allow_basic = allow_basic
+        self.bootstrap_admins = {value.strip() for value in bootstrap_admins.split(",") if value.strip()}
+        # Break-glass identity: exactly one username may authenticate against the
+        # local password store when the directory is unreachable or misconfigured.
+        self.fallback_admin = (fallback_admin or "").strip()
+        self.fallback_credentials = dict(fallback_credentials or {})
         self.sessions = (PersistentSessions(store, session_ttl_seconds, session_idle_seconds,
                                             max_sessions_per_user, "ldap") if store else None)
         self.service_tokens = ServiceTokens(store) if store else None
@@ -399,12 +406,53 @@ class LDAPAuthenticator(Authenticator):
         except AuthenticationError: raise
         except Exception as exc: raise AuthenticationError("LDAP authentication failed") from exc
 
+    def _verify_fallback(self, username: str, password: str) -> bool:
+        if not self.fallback_admin or username != self.fallback_admin or not password:
+            return False
+        if self.store:
+            account = self.store.one(
+                "SELECT a.*,u.enabled AS principal_enabled,u.principal_type FROM local_accounts a "
+                "JOIN users u ON u.username=a.username WHERE a.username=?", (username,))
+            if account:
+                if (not account["enabled"] or not account["principal_enabled"] or
+                        account["principal_type"] != "human"):
+                    return False
+                candidate = LocalAuthenticator._hash(password, account["password_salt"])
+                return secrets.compare_digest(account["password_hash"], candidate)
+            # No durable local account (LDAP mode never seeds one). Accept the
+            # configured credential only outside production; a production
+            # deployment must provision the break-glass account offline.
+            import os
+            if os.getenv("SFSS_ENVIRONMENT", "development") == "production":
+                return False
+        expected = self.fallback_credentials.get(username)
+        return bool(expected and secrets.compare_digest(expected, password))
+
     def login(self, username: str, password: str, zone: str = "development", *, audit=None) -> str:
-        self._bind(username, password)
+        fallback_used = False
+        try:
+            self._bind(username, password)
+        except AuthenticationError:
+            # The designated break-glass administrator may sign in locally when
+            # the directory cannot authenticate it (outage, misconfiguration,
+            # or the account simply not existing in the directory yet).
+            if not self._verify_fallback(username, password):
+                raise
+            fallback_used = True
         if not self.sessions: raise AuthenticationError("persistent LDAP session store unavailable")
-        return self.sessions.issue(username, zone, audit=audit, pre_statements=((
-            "INSERT INTO users(username,global_admin,principal_type,enabled) VALUES(?,0,'human',1) "
-            "ON CONFLICT(username) DO NOTHING", (username,)),))
+        # A bootstrap administrator keeps its platform grant on first login;
+        # the upsert never demotes an already-promoted identity. The fallback
+        # administrator is always a platform administrator by definition.
+        is_bootstrap = int(username in self.bootstrap_admins or fallback_used)
+        audited = dict(audit) if audit is not None else None
+        if fallback_used and audited is not None:
+            details = dict(audited.get("details") or {})
+            details["ldap_fallback"] = True
+            audited["details"] = details
+        return self.sessions.issue(username, zone, audit=audited, pre_statements=((
+            "INSERT INTO users(username,global_admin,principal_type,enabled) VALUES(?,?,'human',1) "
+            "ON CONFLICT(username) DO UPDATE SET global_admin=MAX(users.global_admin,excluded.global_admin)",
+            (username, is_bootstrap)),))
 
     def logout(self, headers, *, audit=None):
         value = headers.get("Authorization", "")

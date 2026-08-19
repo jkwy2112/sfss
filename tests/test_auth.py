@@ -164,6 +164,69 @@ class AuthTest(unittest.TestCase):
             with self.subTest(username=username), self.assertRaisesRegex(AuthenticationError, "invalid username"):
                 auth._bind(username, "password")
 
+    def test_ldap_login_grants_bootstrap_admin_without_demoting_others(self):
+        auth = LDAPAuthenticator("ldap://ad.example:389", "dc=example,dc=com",
+                                 "uid={username},ou=People,{base_dn}", store=self.store,
+                                 bootstrap_admins="diradmin, other-admin")
+        with patch.object(LDAPAuthenticator, "_bind"):
+            auth.login("diradmin", "pw", "admin")
+            auth.login("ordinary", "pw", "green")
+        self.assertEqual(1, self.store.one(
+            "SELECT global_admin FROM users WHERE username='diradmin'")["global_admin"])
+        self.assertEqual(0, self.store.one(
+            "SELECT global_admin FROM users WHERE username='ordinary'")["global_admin"])
+        # A later manual promotion must survive bootstrap logins.
+        self.store.execute("UPDATE users SET global_admin=1 WHERE username='ordinary'")
+        with patch.object(LDAPAuthenticator, "_bind"):
+            auth.login("ordinary", "pw", "green")
+        self.assertEqual(1, self.store.one(
+            "SELECT global_admin FROM users WHERE username='ordinary'")["global_admin"])
+
+    def test_ldap_fallback_admin_signs_in_when_directory_fails(self):
+        auth = LDAPAuthenticator("ldap://ad.example:389", "dc=example,dc=com",
+                                 "uid={username},ou=People,{base_dn}", store=self.store,
+                                 fallback_admin="admin",
+                                 fallback_credentials={"admin": "admin123"})
+        # Directory rejects everyone (bind raises).
+        with patch.object(LDAPAuthenticator, "_bind",
+                          side_effect=AuthenticationError("LDAP authentication failed")):
+            token = auth.login("admin", "admin123", "admin")
+            self.assertTrue(token)
+            with self.assertRaises(AuthenticationError):
+                auth.login("admin", "wrong-password", "admin")
+            with self.assertRaises(AuthenticationError):
+                auth.login("someone-else", "admin123", "green")
+        self.assertEqual(1, self.store.one(
+            "SELECT global_admin FROM users WHERE username='admin'")["global_admin"])
+        session = auth.authenticate(_headers_with_bearer(token, "admin"))
+        self.assertEqual("admin", session.username)
+
+    def test_ldap_fallback_requires_configuration_and_durable_account_in_production(self):
+        auth = LDAPAuthenticator("ldap://ad.example:389", "dc=example,dc=com",
+                                 "uid={username},ou=People,{base_dn}", store=self.store)
+        with patch.object(LDAPAuthenticator, "_bind",
+                          side_effect=AuthenticationError("LDAP authentication failed")):
+            with self.assertRaises(AuthenticationError):
+                auth.login("admin", "anything", "admin")
+        # A durable local account is honored even without configured credentials.
+        LocalAuthenticator({}, {"admin": "durable-pass-1"}, self.store).set_password(
+            "admin", "durable-pass-1")
+        configured = LDAPAuthenticator("ldap://ad.example:389", "dc=example,dc=com",
+                                       "uid={username},ou=People,{base_dn}", store=self.store,
+                                       fallback_admin="admin")
+        with patch.object(LDAPAuthenticator, "_bind",
+                          side_effect=AuthenticationError("LDAP authentication failed")):
+            self.assertTrue(configured.login("admin", "durable-pass-1", "admin"))
+            with self.assertRaises(AuthenticationError):
+                configured.login("admin", "admin123", "admin")
+
+
+def _headers_with_bearer(token: str, zone: str):
+    from email.message import Message
+    message = Message(); message["Authorization"] = f"Bearer {token}"
+    message["X-SFSS-Gateway-Role"] = zone
+    return message
+
     def test_service_token_is_hashed_scoped_and_revocable(self):
         self.store.execute("INSERT INTO users(username,principal_type,enabled) VALUES('red-agent','service',1)")
         raw, record = ServiceTokens(self.store).issue(
