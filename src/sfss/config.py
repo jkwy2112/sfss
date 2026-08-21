@@ -76,6 +76,7 @@ class Settings:
     yara_rules_sha256: str = ""
     retention_seconds: int = 7 * 24 * 3600
     max_upload_bytes: int = 100 * 1024 * 1024
+    upload_speed_limit_bytes: int = 0
     dev_users: str = "admin:admin,alice:uploader,reader:downloader"
     bootstrap_admins: str = "admin"
     local_credentials: str = "admin:admin123,alice:alice123,reader:reader123"
@@ -151,6 +152,7 @@ class Settings:
             yara_rules_sha256=os.getenv("SFSS_YARA_RULES_SHA256", "").lower().strip(),
             retention_seconds=int(os.getenv("SFSS_RETENTION_SECONDS", str(7 * 24 * 3600))),
             max_upload_bytes=int(os.getenv("SFSS_MAX_UPLOAD_BYTES", str(100 * 1024 * 1024))),
+            upload_speed_limit_bytes=int(os.getenv("SFSS_UPLOAD_SPEED_LIMIT_BYTES", "0")),
             dev_users=os.getenv("SFSS_DEV_USERS", "admin:admin,alice:uploader,reader:downloader"),
             bootstrap_admins=os.getenv("SFSS_BOOTSTRAP_ADMINS", "admin" if auth_backend == "local" else ""),
             local_credentials=os.getenv("SFSS_LOCAL_CREDENTIALS", "admin:admin123,alice:alice123,reader:reader123"),
@@ -318,6 +320,7 @@ class Settings:
         if not 1 <= self.clamav_port <= 65535: raise ValueError("SFSS_CLAMAV_PORT is invalid")
         if self.clamav_stream_max_bytes <= 0: raise ValueError("SFSS_CLAMAV_STREAM_MAX_BYTES must be positive")
         if self.max_upload_bytes <= 0: raise ValueError("SFSS_MAX_UPLOAD_BYTES must be positive")
+        if self.upload_speed_limit_bytes < 0: raise ValueError("SFSS_UPLOAD_SPEED_LIMIT_BYTES cannot be negative")
         if not 1024 * 1024 <= self.multipart_chunk_bytes <= 128 * 1024 * 1024:
             raise ValueError("SFSS_MULTIPART_CHUNK_BYTES must be between 1 MiB and 128 MiB")
         if min(self.retention_seconds, self.purge_grace_seconds, self.maintenance_interval_seconds,

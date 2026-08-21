@@ -819,6 +819,28 @@ class ServiceTest(unittest.TestCase):
             with patch("sfss.config.platform.python_version", return_value="3.12.12"):
                 create_runtime(self.secure_production_settings())
 
+    def test_upload_speed_limit_throttles_part_uploads(self):
+        import time as _time
+        self.store.set_config("upload_speed_limit_bytes", str(2 * 1024 * 1024), "admin")  # 2 MB/s
+        session = self.service.create_upload_session("inbound", "slow.bin", 4 * 1024 * 1024 + 1, "alice")
+        part = b"x" * min(session["chunk_size"], 4 * 1024 * 1024 + 1)  # match the plan for part 1
+        started = _time.monotonic()
+        self.service.put_upload_part(session["id"], 1, io.BytesIO(part), len(part),
+                                     hashlib.sha256(part).hexdigest(), "alice")
+        elapsed = _time.monotonic() - started
+        minimum = 0.8 * len(part) / (2 * 1024 * 1024)  # throttled at 2MB/s
+        self.assertGreaterEqual(elapsed, minimum * 0.8, "throttled part must take near its minimum duration")
+        self.store.set_config("upload_speed_limit_bytes", "0", "admin")  # unlimited again
+        started = _time.monotonic()
+        self.service.put_upload_part(session["id"], 1, io.BytesIO(part), len(part),  # same part, upsert
+                                     hashlib.sha256(part).hexdigest(), "alice")
+        self.assertLess(_time.monotonic() - started, 0.5, "unlimited upload must not sleep")
+
+    def test_upload_speed_limit_rejects_out_of_range_config(self):
+        from sfss.config import Settings as _S
+        with self.assertRaisesRegex(ValueError, "UPLOAD_SPEED_LIMIT"):
+            _S(data_dir=self.settings.data_dir, upload_speed_limit_bytes=-1).validate()
+
     def test_maintenance_expires_incomplete_upload_session(self):
         session = self.service.create_upload_session("inbound", "partial.txt", 4, "alice")
         self.service.put_upload_part(session["id"], 1, io.BytesIO(b"data"), 4,

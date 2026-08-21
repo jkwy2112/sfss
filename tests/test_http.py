@@ -358,6 +358,44 @@ class HttpTest(unittest.TestCase):
         self.assertEqual("admin", json.loads(payload)["username"])
         self.assertTrue(json.loads(payload)["global_admin"])
 
+    def test_full_login_logout_lifecycle_is_clean_across_portals(self):
+        # Mirrors the browser UX: login carries no portal header (development
+        # session), every portal can use it, logout kills it everywhere.
+        body = json.dumps({"username": "admin", "password": "admin123"}).encode()
+        status, _, payload = self.request("POST", "/v1/auth/login", body, {
+            "Content-Type":"application/json", "Content-Length":str(len(body)),
+        })
+        self.assertEqual(200, status)
+        token = json.loads(payload)["token"]
+
+        # Usable from every portal entrance without any re-login.
+        for extra in ({"X-SFSS-Zone":"green"}, {"X-SFSS-Zone":"red"},
+                      {"X-SFSS-Gateway-Role":"admin"}, {}):
+            headers = {"Authorization":f"Bearer {token}", **extra}
+            self.assertEqual(200, self.request("GET", "/v1/me", headers=headers)[0])
+
+        # Logout revokes with or without portal headers (the SPA may send any).
+        for extra in ({"X-SFSS-Zone":"green"}, {}):
+            headers = {"Authorization":f"Bearer {token}", "X-SFSS-CSRF":"1", **extra}
+            self.assertIn(self.request("POST", "/v1/auth/logout", b"", headers)[0], (204, 401))
+        self.assertEqual(401, self.request("GET", "/v1/me",
+            headers={"Authorization":f"Bearer {token}"})[0])
+
+    def test_development_session_works_across_all_entrances(self):
+        body = json.dumps({"username": "admin", "password": "admin123"}).encode()
+        status, _, payload = self.request("POST", "/v1/auth/login", body, {
+            "Content-Type":"application/json", "Content-Length":str(len(body)),
+        })
+        self.assertEqual(200, status)
+        login = json.loads(payload); self.assertEqual("development", login["session_zone"])
+        token = login["token"]
+        # Root-path (development) sessions stay usable from every portal,
+        # including the admin console with its gateway-role header.
+        for zone_header in ({"X-SFSS-Zone":"green"}, {"X-SFSS-Zone":"red"},
+                            {"X-SFSS-Gateway-Role":"admin"}):
+            headers = {"Authorization":f"Bearer {token}", **zone_header}
+            self.assertEqual(200, self.request("GET", "/v1/me", headers=headers)[0])
+
     def test_login_session_cannot_be_replayed_between_green_and_red(self):
         body = json.dumps({"username": "admin", "password": "admin123"}).encode()
         status, _, payload = self.request("POST", "/v1/auth/login", body, {

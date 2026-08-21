@@ -181,7 +181,11 @@ class PersistentSessions:
             raise AuthenticationError("invalid or expired session")
         # Do not revoke a valid session merely because somebody attempted to
         # replay it at another entrance; retain evidence and original access.
-        if row["zone"] != requested_zone:
+        # Development-entrance sessions are the compatibility entrance: they
+        # stay usable from the dedicated portals too (the reverse is still
+        # rejected), so a root-path login keeps working on /green, /red, and
+        # /admin without another sign-in.
+        if row["zone"] != requested_zone and not (row["zone"] == "development"):
             raise AuthenticationError("session is not valid for this entrance")
         self.store.execute("UPDATE auth_sessions SET last_seen_at=? WHERE token_hash=?", (now, digest))
         return Identity(row["username"], zone=row["zone"])

@@ -835,6 +835,8 @@ def make_handler(service: SFSSService, authenticator):
                     "clamav_host": service.store.get_config("clamav_host", service.settings.clamav_host),
                     "clamav_port": int(service.store.get_config("clamav_port", str(service.settings.clamav_port))),
                     "clamav_stream_max_mb": service.settings.clamav_stream_max_bytes // (1024 * 1024),
+                    "upload_speed_mbps": int(service.store.get_config(
+                        "upload_speed_limit_bytes", str(service.settings.upload_speed_limit_bytes))) // (1024 * 1024),
                     "yara_rules": service.store.get_config("yara_rules", service.settings.yara_rules),
                     "service_token_max_hours": service.settings.service_token_max_ttl_seconds // 3600,
                 })
@@ -907,6 +909,8 @@ def make_handler(service: SFSSService, authenticator):
                     min_free_gb = int(data.get("min_free_gb", int(service.store.get_config(
                         "min_free_bytes", str(service.settings.min_free_bytes))) // (1024 ** 3)))
                     clamav_port = int(data.get("clamav_port", 3310))
+                    upload_speed_mbps = int(data.get("upload_speed_mbps", int(service.store.get_config(
+                        "upload_speed_limit_bytes", str(service.settings.upload_speed_limit_bytes))) // (1024 * 1024)))
                 except (TypeError, ValueError) as exc:
                     raise ServiceError(400, "numeric configuration is invalid") from exc
                 scanners = str(data.get("scanners", "")).strip()
@@ -923,6 +927,8 @@ def make_handler(service: SFSSService, authenticator):
                     raise ServiceError(400, "user staging quota must be at least the single-file limit")
                 if not scanner_names or not scanner_names.issubset({"mock", "clamav", "yara"}):
                     raise ServiceError(400, "scanner list must contain mock, clamav, or yara")
+                if not 0 <= upload_speed_mbps <= 10240:
+                    raise ServiceError(400, "upload speed limit must be between 0 (unlimited) and 10240 MB/s")
                 if service.settings.environment == "production" and ("mock" in scanner_names or "clamav" not in scanner_names):
                     raise ServiceError(400, "production scanner policy requires clamav and forbids mock")
                 if "clamav" in scanner_names and max_upload_mb * 1024 * 1024 > service.settings.clamav_stream_max_bytes:
@@ -952,6 +958,7 @@ def make_handler(service: SFSSService, authenticator):
                     "max_staged_bytes_per_user": str(staged_gb * 1024 ** 3),
                     "min_free_bytes": str(min_free_gb * 1024 ** 3),
                     "clamav_host": clamav_host, "clamav_port": str(clamav_port), "yara_rules": yara_rules,
+                    "upload_speed_limit_bytes": str(upload_speed_mbps * 1024 * 1024),
                 }
                 projected = {row["key"]:row["value"] for row in service.store.all(
                     "SELECT key,value FROM system_config ORDER BY key")}

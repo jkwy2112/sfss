@@ -172,6 +172,26 @@ class SFSSService:
         if required_bytes < 0 or status["free_bytes"] - required_bytes < status["reserve_bytes"]:
             raise ServiceError(507, "insufficient storage capacity while preserving the safety reserve")
 
+    class _RateLimiter:
+        """Token-window throttler for inbound body streams (0 = unlimited)."""
+        def __init__(self, bytes_per_second: int):
+            self.rate = max(0, int(bytes_per_second))
+            self.window_start = time.monotonic()
+            self.transferred = 0
+
+        def wait(self, nbytes: int):
+            if not self.rate: return
+            self.transferred += nbytes
+            elapsed = time.monotonic() - self.window_start
+            expected = self.transferred / self.rate
+            delay = expected - elapsed
+            if delay > 0.005: time.sleep(min(delay, 1.0))
+
+    def upload_rate_limiter(self) -> "_RateLimiter":
+        limit = int(self.store.get_config("upload_speed_limit_bytes",
+                                          str(self.settings.upload_speed_limit_bytes)))
+        return self._RateLimiter(limit)
+
     def _require_active_user(self, actor: str):
         row = self.store.one("SELECT enabled FROM users WHERE username=?", (actor,))
         if not row or not row["enabled"]:
@@ -292,12 +312,14 @@ class SFSSService:
         target = directory / f"part-{part_number:08d}"
         temporary = directory / f".part-{part_number:08d}-{uuid.uuid4().hex}.tmp"
         digest = hashlib.sha256(); written = 0
+        limiter = self.upload_rate_limiter()
         try:
             with temporary.open("xb") as output:
                 while written < size:
                     block = stream.read(min(1024 * 1024, size - written))
                     if not block: break
                     written += len(block); digest.update(block); output.write(block)
+                    limiter.wait(len(block))
             try: temporary.chmod(0o600)
             except FileNotFoundError as exc:
                 raise ServiceError(409, "upload session changed while receiving the part") from exc
@@ -619,12 +641,14 @@ class SFSSService:
         self.require_storage_capacity(size)
         transfer_id = str(uuid.uuid4()); target_dir = self.outbound_isolation / transfer_id; target_dir.mkdir(mode=0o700); target = target_dir / "payload"
         digest = hashlib.sha256(); prefix = b""; written = 0
+        limiter = self.upload_rate_limiter()
         try:
             with target.open("xb") as output:
                 while written < size:
                     block = stream.read(min(1024 * 1024, size - written))
                     if not block: break
                     written += len(block); digest.update(block); prefix += block[:max(0, 8192-len(prefix))]; output.write(block)
+                    limiter.wait(len(block))
             target.chmod(0o600)
             if written != size: raise ServiceError(400, "request body shorter than Content-Length")
             detected = detect_content(prefix); conflict = extension_conflicts(filename, detected); now = int(time.time())
@@ -883,6 +907,7 @@ class SFSSService:
         digest = hashlib.sha256()
         prefix = b""
         written = 0
+        limiter = self.upload_rate_limiter()
         try:
             with target.open("xb") as output:
                 while written < size:
@@ -894,6 +919,7 @@ class SFSSService:
                     if len(prefix) < 8192:
                         prefix += block[:8192 - len(prefix)]
                     output.write(block)
+                    limiter.wait(len(block))
             target.chmod(0o600)
             if written != size:
                 raise ServiceError(400, "request body shorter than Content-Length")

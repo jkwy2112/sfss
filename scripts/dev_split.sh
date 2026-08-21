@@ -50,6 +50,10 @@ start_one() {
   local py; py="$(python_bin)"
   mkdir -p "$data_dir"
   SFSS_DEPLOYMENT_MODE="$mode" SFSS_DATA_DIR="$data_dir" SFSS_ENVIRONMENT=development \
+  SFSS_SCANNERS="${SFSS_SCANNERS:-clamav}" \
+  SFSS_CLAMAV_HOST="${SFSS_CLAMAV_HOST:-127.0.0.1}" SFSS_CLAMAV_PORT="${SFSS_CLAMAV_PORT:-3310}" \
+  SFSS_CLAMAV_STREAM_MAX_BYTES="${SFSS_CLAMAV_STREAM_MAX_BYTES:-2147483648}" \
+  SFSS_MAX_UPLOAD_BYTES="${SFSS_MAX_UPLOAD_BYTES:-2147483648}" \
   PYTHONPATH="$REPO/src" "$@" nohup "$py" -m sfss.server --port "$port" > "$log" 2>&1 &
   local pid=$!
   for _ in $(seq 1 50); do
